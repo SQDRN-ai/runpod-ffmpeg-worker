@@ -102,17 +102,20 @@ def handler(event):
     subtitles_filter = f"subtitles=/tmp/subs.ass"
 
     cmd = [
-        "ffmpeg", "-y",
-        "-i", "/tmp/in.mp4",
-        "-vf", subtitles_filter,
-        "-c:v", "libx265",
-        "-preset", preset,
-        "-crf", str(crf),
-        "-pix_fmt", "yuv420p",
-        "-s", f"{width}x{height}",
-        "-an",
-        "/tmp/out.mp4"
-    ]
+    "ffmpeg", "-y",
+    "-i", "/tmp/in.mp4",
+    "-vf", subtitles_filter,
+    "-c:v", "libx264",
+    "-profile:v", "high",
+    "-level", "4.2",
+    "-preset", preset,      # medium is fine
+    "-crf", str(crf),       # recommend crf=20
+    "-pix_fmt", "yuv420p",
+    "-movflags", "+faststart",
+    "-s", f"{width}x{height}",
+    "-an",
+    "/tmp/out.mp4"
+]
 
     ff = run_ffmpeg(cmd)
     if ff["returncode"] != 0:
