@@ -112,6 +112,54 @@ def _escape_for_subtitles_filter(value: str) -> str:
 
 
 # -----------------------------
+# Duration helpers  ✅ ONLY NEW FIX
+# -----------------------------
+def ass_time_to_seconds(t: str) -> float:
+    # ASS: H:MM:SS.cs (centiseconds)
+    h, m, rest = t.split(":")
+    s, cs = rest.split(".")
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100.0
+
+
+def get_ass_end_seconds(path: str) -> float:
+    max_end = 0.0
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if not line.startswith("Dialogue:"):
+                continue
+            # Dialogue: Layer, Start, End, Style, ...
+            parts = line.split(",", 3)
+            if len(parts) < 3:
+                continue
+            end_t = parts[2].strip()
+            try:
+                end_s = ass_time_to_seconds(end_t)
+                if end_s > max_end:
+                    max_end = end_s
+            except Exception:
+                pass
+    return max_end
+
+
+def get_media_duration_seconds(path: str) -> float:
+    # Uses ffprobe to read container duration (more reliable than MP3 "audible end")
+    p = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            path
+        ],
+        capture_output=True,
+        text=True
+    )
+    try:
+        return float(p.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+# -----------------------------
 # Name overlay (wave letters)
 # -----------------------------
 def _ensure_ass_header(play_w: int, play_h: int) -> str:
@@ -368,6 +416,12 @@ def handler(event):
         download_from_r2(ass_key, TMP_ASS)
         download_from_r2(music_key, TMP_MUSIC)
 
+        # ✅ ONLY NEW FIX: determine a hard output duration cap from ASS end OR audio duration
+        ass_end = get_ass_end_seconds(TMP_ASS)
+        audio_end = get_media_duration_seconds(TMP_MUSIC)
+        pad = float(render.get("end_pad_seconds", 0.3))
+        duration_cap = max(ass_end, audio_end) + pad if (ass_end > 0 or audio_end > 0) else None
+
         # 2) Optional fonts.zip -> /tmp/fonts (pure python unzip)
         fontsdir = None
         zip_key = fonts_cfg.get("zip_key")
@@ -409,7 +463,7 @@ def handler(event):
 
         vf = ",".join(filters)
 
-        # 4) Audio filter  ✅ ONLY CHANGE: add aresample=async=1 (and keep volume)
+        # 4) Audio filter (unchanged)
         af_parts = []
         if a_volume is not None:
             af_parts.append(f"volume={float(a_volume)}")
@@ -446,6 +500,10 @@ def handler(event):
         if af:
             cmd += ["-af", af]
 
+        # ✅ ONLY NEW FIX: hard cap the output duration
+        if duration_cap is not None:
+            cmd += ["-t", f"{duration_cap:.3f}"]
+
         cmd.append(TMP_OUT)
 
         p = subprocess.run(cmd, capture_output=True, text=True)
@@ -472,6 +530,9 @@ def handler(event):
             "ffmpeg_stderr_tail": p.stderr[-20000:],
             "canvas": {"width": play_w, "height": play_h},
             "timing": {"loop_video": loop_video},
+            "duration_cap_seconds": duration_cap,
+            "ass_end_seconds": ass_end,
+            "audio_end_seconds": audio_end,
         }
 
     except Exception as e:
