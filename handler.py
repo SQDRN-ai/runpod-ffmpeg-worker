@@ -3,7 +3,7 @@ import subprocess
 import uuid
 import runpod
 import boto3
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 TMP_IN = "/tmp/in.mp4"
 TMP_ASS = "/tmp/subtitles.ass"
@@ -57,9 +57,7 @@ def _ass_color_from_hex_rgba(hex_rgba: str) -> str:
     gg = s[3:5]
     bb = s[5:7]
     aa = s[7:9] if len(s) == 9 else "00"  # 00 = fully opaque in ASS alpha
-
-    # ASS is AABBGGRR
-    return f"&H{aa}{bb}{gg}{rr}&"
+    return f"&H{aa}{bb}{gg}{rr}&"  # AABBGGRR
 
 
 def _normalize_ass_color(v: Any, fallback: str) -> str:
@@ -77,7 +75,6 @@ def _normalize_ass_color(v: Any, fallback: str) -> str:
         return s
     if s.startswith("#"):
         return _ass_color_from_hex_rgba(s)
-    # assume user provided valid ASS color string
     return s
 
 
@@ -95,7 +92,6 @@ def _build_force_style(force_style: Dict[str, Any]) -> str:
 
 def _escape_for_subtitles_filter(value: str) -> str:
     """
-    Escapes characters that can break ffmpeg filter arguments.
     force_style is wrapped in single quotes; escape backslashes and single quotes.
     """
     return value.replace("\\", "\\\\").replace("'", r"\'")
@@ -126,7 +122,6 @@ def _make_name_overlay_ass(cfg: Dict[str, Any], play_w: int, play_h: int) -> str
     if not text:
         raise ValueError("name_overlay.text is required")
 
-    # Defaults: tuned for 4K (3840x2160) but works for any PlayRes via JSON.
     font = cfg.get("font", "Montserrat ExtraBold")
     size = int(cfg.get("size", 300))
     outline = float(cfg.get("outline", 20))
@@ -142,14 +137,10 @@ def _make_name_overlay_ass(cfg: Dict[str, Any], play_w: int, play_h: int) -> str
     outline_col = _normalize_ass_color(cfg.get("outline_color"), "&H00000000&")
     back_col = _normalize_ass_color(cfg.get("back_color"), "&H00000000&")
 
-    # Optional explicit positioning
     x = cfg.get("x")
     y = cfg.get("y")
-    pos_tag = ""
-    if x is not None and y is not None:
-        pos_tag = rf"\pos({int(x)},{int(y)})"
+    pos_tag = rf"\pos({int(x)},{int(y)})" if x is not None and y is not None else ""
 
-    # Optional rotation
     rotate = float(cfg.get("rotate_deg", 0))
     rot_tag = rf"\frz{rotate}" if rotate else ""
 
@@ -157,7 +148,6 @@ def _make_name_overlay_ass(cfg: Dict[str, Any], play_w: int, play_h: int) -> str
     fade_out_ms = int(cfg.get("fade_out_ms", 900))
     anim = str(cfg.get("animation", "sparkle_glow")).strip().lower()
 
-    # Style section
     style_line = (
         "Style: NAME, {font}, {size}, {pri}, {sec}, {olc}, {bac}, "
         "1,0,0,0, 100,100, {sp}, 0, 1, {ol}, {sh}, {an}, {ml}, {mr}, {mv}, 1\n"
@@ -177,12 +167,10 @@ def _make_name_overlay_ass(cfg: Dict[str, Any], play_w: int, play_h: int) -> str
         mv=margin_v,
     )
 
-    # Sparkle/glow animation using blur + slight scale pulses + optional outline shimmer
     if anim == "sparkle_glow":
         shimmer_outline = cfg.get("shimmer_outline_color")
         shimmer_outline = _normalize_ass_color(shimmer_outline, outline_col) if shimmer_outline else None
 
-        # Repeat-like pulse segments (3.6s loop-ish feel)
         pulse = (
             rf"\fad({fade_in_ms},{fade_out_ms})"
             rf"\blur2\be1"
@@ -204,7 +192,6 @@ def _make_name_overlay_ass(cfg: Dict[str, Any], play_w: int, play_h: int) -> str
     else:
         tags = rf"{{\an{alignment}{pos_tag}{rot_tag}\fad({fade_in_ms},{fade_out_ms})}}}"
 
-    # Events section: layer 10 so it stays above karaoke subtitles
     dialogue = (
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -219,10 +206,6 @@ def _make_name_overlay_ass(cfg: Dict[str, Any], play_w: int, play_h: int) -> str
 
 
 def _get_canvas(render: Dict[str, Any]) -> Tuple[int, int]:
-    """
-    Canvas controls the ASS PlayRes and should match your target output resolution,
-    especially for predictable 4K text sizing.
-    """
     canvas = render.get("canvas", {}) or {}
     w = int(canvas.get("width", 3840))
     h = int(canvas.get("height", 2160))
@@ -263,12 +246,16 @@ def handler(event):
     render = inp.get("render", {}) or {}
     subs_cfg = render.get("subtitles", {}) or {}
     name_cfg = render.get("name_overlay", None)
+    timing_cfg = render.get("timing", {}) or {}
 
-    # Canvas (ASS PlayRes) — set to 4K by default for predictable sizing
+    # Canvas (ASS PlayRes) — default 4K for predictable sizing
     try:
         play_w, play_h = _get_canvas(render)
     except Exception as e:
         return {"error": "Invalid render.canvas", "details": str(e)}
+
+    # Timing controls
+    loop_video = bool(timing_cfg.get("loop_video", False))
 
     # Video/audio encoding knobs (optional)
     video_cfg = render.get("video", {}) or {}
@@ -278,14 +265,14 @@ def handler(event):
     v_preset = video_cfg.get("preset", "medium")
     v_crf = str(video_cfg.get("crf", 18))
     v_pix_fmt = video_cfg.get("pix_fmt", "yuv420p")
-    v_profile = video_cfg.get("profile", "high")  # safe default for most platforms
-    v_tune = video_cfg.get("tune", None)          # e.g. "film"
-    v_scale = video_cfg.get("scale", None)        # e.g. "3840:2160" or "1080:-2"
+    v_profile = video_cfg.get("profile", "high")
+    v_tune = video_cfg.get("tune", None)
+    v_scale = video_cfg.get("scale", None)
     faststart = bool(video_cfg.get("movflags_faststart", True))
 
     a_codec = audio_cfg.get("codec", "aac")
     a_bitrate = audio_cfg.get("bitrate", "192k")
-    a_volume = audio_cfg.get("volume", None)      # e.g. 1.08
+    a_volume = audio_cfg.get("volume", None)
 
     # 1) Download inputs
     download_from_r2(video_key, TMP_IN)
@@ -326,16 +313,22 @@ def handler(event):
     af = None
     if a_volume is not None:
         try:
-            vol = float(a_volume)
-            af = f"volume={vol}"
+            af = f"volume={float(a_volume)}"
         except Exception:
             return {"error": "audio.volume must be a number (e.g. 1.08)"}
 
     # 4) ffmpeg command
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", TMP_IN,
-        "-i", TMP_MUSIC,
+    cmd = ["ffmpeg", "-y"]
+
+    # Loop the VIDEO input if requested, so audio determines final duration
+    if loop_video:
+        cmd += ["-stream_loop", "-1", "-i", TMP_IN]
+    else:
+        cmd += ["-i", TMP_IN]
+
+    cmd += ["-i", TMP_MUSIC]
+
+    cmd += [
         "-vf", vf,
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -385,6 +378,7 @@ def handler(event):
         "ffmpeg_cmd": cmd,
         "ffmpeg_stderr_tail": p.stderr[-20000:],
         "canvas": {"width": play_w, "height": play_h},
+        "timing": {"loop_video": loop_video},
     }
 
 
