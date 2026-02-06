@@ -20,7 +20,6 @@ def r2_client():
     except Exception as e:
         raise RuntimeError(f"boto3 import failed (is it installed in the image?): {e}")
 
-    # Requires: R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
     required = ["R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
     missing = [k for k in required if not os.environ.get(k)]
     if missing:
@@ -174,7 +173,7 @@ def _make_name_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
             "\\t(3000,3600,\\blur2\\be1\\fscx100\\fscy100)"
         )
 
-        # IMPORTANT: use "\\3c" explicitly (avoid "\3" octal-escape weirdness)
+        # IMPORTANT: use "\\\\3c" to literally emit "\3c" in the ASS file
         if shimmer_outline and shimmer_outline != outline_col:
             pulse += f"\\t(0,600,\\\\3c{shimmer_outline})\\t(600,1200,\\\\3c{outline_col})"
             pulse += f"\\t(1200,1800,\\\\3c{shimmer_outline})\\t(1800,2400,\\\\3c{outline_col})"
@@ -182,7 +181,8 @@ def _make_name_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
 
         tags = f"{{\\an{alignment}{pos_tag}{rot_tag}{pulse}}}"
     else:
-        tags = f"{{\\an{alignment}{pos_tag}{rot_tag}\\fad({fade_in_ms},{fade_out_ms})}}}"
+        # ✅ fixed: no extra brace at the end
+        tags = f"{{\\an{alignment}{pos_tag}{rot_tag}\\fad({fade_in_ms},{fade_out_ms})}}"
 
     dialogue = (
         "[Events]\n"
@@ -228,11 +228,7 @@ def handler(event):
             return {
                 "error": "Missing required inputs.",
                 "required": ["video_key", "ass_key", "music_key"],
-                "got": {
-                    "video_key": bool(video_key),
-                    "ass_key": bool(ass_key),
-                    "music_key": bool(music_key),
-                },
+                "got": {"video_key": bool(video_key), "ass_key": bool(ass_key), "music_key": bool(music_key)},
             }
 
         render = inp.get("render", {}) or {}
@@ -259,12 +255,10 @@ def handler(event):
         a_bitrate = audio_cfg.get("bitrate", "192k")
         a_volume = audio_cfg.get("volume", None)
 
-        # Download inputs
         download_from_r2(video_key, TMP_IN)
         download_from_r2(ass_key, TMP_ASS)
         download_from_r2(music_key, TMP_MUSIC)
 
-        # Build filters
         filters = []
         if v_scale:
             filters.append(f"scale={v_scale}")
@@ -290,7 +284,6 @@ def handler(event):
         if a_volume is not None:
             af = f"volume={float(a_volume)}"
 
-        # ffmpeg cmd
         cmd = ["ffmpeg", "-y"]
         if loop_video:
             cmd += ["-stream_loop", "-1", "-i", TMP_IN]
@@ -348,7 +341,6 @@ def handler(event):
         }
 
     except Exception as e:
-        # This ensures requests return an error instead of killing the worker
         return {"error": "handler exception", "details": str(e)}
 
 
