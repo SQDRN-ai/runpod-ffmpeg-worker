@@ -1,6 +1,7 @@
 import os
 import subprocess
 import uuid
+import math
 import runpod
 
 TMP_IN = "/tmp/in.mp4"
@@ -10,6 +11,7 @@ TMP_NAME_ASS = "/tmp/name_overlay.ass"
 TMP_OUT = "/tmp/final.mp4"
 
 print("✅ handler.py loaded (startup ok)")
+
 
 # -----------------------------
 # R2 helpers (lazy-import boto3)
@@ -54,6 +56,9 @@ def upload_to_r2(local_path: str, key: str):
 # ASS helpers
 # -----------------------------
 def _ass_color_from_hex_rgba(hex_rgba: str) -> str:
+    """
+    Convert "#RRGGBB" or "#RRGGBBAA" into ASS "&HAABBGGRR&"
+    """
     s = hex_rgba.strip()
     if not s.startswith("#") or len(s) not in (7, 9):
         raise ValueError("hex_rgba must be '#RRGGBB' or '#RRGGBBAA'")
@@ -65,6 +70,11 @@ def _ass_color_from_hex_rgba(hex_rgba: str) -> str:
 
 
 def _normalize_ass_color(v, fallback: str) -> str:
+    """
+    Accepts:
+      - ASS colors like "&H00FFFFFF&"
+      - hex like "#RRGGBB" or "#RRGGBBAA"
+    """
     if v is None:
         return fallback
     s = str(v).strip()
@@ -87,6 +97,7 @@ def _build_force_style(force_style: dict) -> str:
 
 
 def _escape_for_subtitles_filter(value: str) -> str:
+    # force_style is wrapped in single quotes
     return value.replace("\\", "\\\\").replace("'", r"\'")
 
 
@@ -106,42 +117,43 @@ def _ensure_ass_header(play_w: int, play_h: int) -> str:
     )
 
 
-def _make_name_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
-    text = str(cfg.get("text", "")).strip()
-    if not text:
-        raise ValueError("name_overlay.text is required")
+def _format_ass_time(ms: int) -> str:
+    """
+    ASS time format: H:MM:SS.cs where cs = centiseconds (1/100s)
+    """
+    if ms < 0:
+        ms = 0
+    cs = int(round(ms / 10.0))
+    s = cs // 100
+    cs_rem = cs % 100
+    m = s // 60
+    s_rem = s % 60
+    h = m // 60
+    m_rem = m % 60
+    return f"{h}:{m_rem:02d}:{s_rem:02d}.{cs_rem:02d}"
 
-    font = cfg.get("font", "Montserrat ExtraBold")
-    size = int(cfg.get("size", 300))
-    outline = float(cfg.get("outline", 20))
-    shadow = float(cfg.get("shadow", 0))
-    spacing = float(cfg.get("spacing", 3))
-    alignment = int(cfg.get("alignment", 5))
 
-    margin_v = int(cfg.get("margin_v", 0))
-    margin_l = int(cfg.get("margin_l", 0))
-    margin_r = int(cfg.get("margin_r", 0))
-
-    primary = _normalize_ass_color(cfg.get("color"), "&H00FFFFFF&")
-    secondary = _normalize_ass_color(cfg.get("secondary_color"), "&H0033CCFF&")
-    outline_col = _normalize_ass_color(cfg.get("outline_color"), "&H00000000&")
-    back_col = _normalize_ass_color(cfg.get("back_color"), "&H00000000&")
-
-    x = cfg.get("x")
-    y = cfg.get("y")
-    pos_tag = f"\\pos({int(x)},{int(y)})" if x is not None and y is not None else ""
-
-    rotate = float(cfg.get("rotate_deg", 0))
-    rot_tag = f"\\frz{rotate}" if rotate else ""
-
-    fade_in_ms = int(cfg.get("fade_in_ms", 500))
-    fade_out_ms = int(cfg.get("fade_out_ms", 900))
-    anim = str(cfg.get("animation", "sparkle_glow")).strip().lower()
-
-    style_line = (
-        "Style: NAME, {font}, {size}, {pri}, {sec}, {olc}, {bac}, "
+def _make_style_line(
+    name: str,
+    font: str,
+    size: int,
+    primary: str,
+    secondary: str,
+    outline_col: str,
+    back_col: str,
+    spacing: float,
+    outline: float,
+    shadow: float,
+    alignment: int,
+    margin_l: int,
+    margin_r: int,
+    margin_v: int,
+) -> str:
+    return (
+        "Style: {nm}, {font}, {size}, {pri}, {sec}, {olc}, {bac}, "
         "1,0,0,0, 100,100, {sp}, 0, 1, {ol}, {sh}, {an}, {ml}, {mr}, {mv}, 1\n"
     ).format(
+        nm=name,
         font=font,
         size=size,
         pri=primary,
@@ -157,43 +169,246 @@ def _make_name_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
         mv=margin_v,
     )
 
-    if anim == "sparkle_glow":
-        shimmer_outline = cfg.get("shimmer_outline_color")
-        shimmer_outline = _normalize_ass_color(shimmer_outline, outline_col) if shimmer_outline else None
 
-        pulse = (
-            f"\\fad({fade_in_ms},{fade_out_ms})"
-            "\\blur2\\be1"
-            "\\fscx100\\fscy100"
-            "\\t(0,600,\\blur7\\be2\\fscx104\\fscy104)"
-            "\\t(600,1200,\\blur2\\be1\\fscx100\\fscy100)"
-            "\\t(1200,1800,\\blur7\\be2\\fscx104\\fscy104)"
-            "\\t(1800,2400,\\blur2\\be1\\fscx100\\fscy100)"
-            "\\t(2400,3000,\\blur7\\be2\\fscx104\\fscy104)"
-            "\\t(3000,3600,\\blur2\\be1\\fscx100\\fscy100)"
+def _sparkle_glow_tags(
+    fade_in_ms: int,
+    fade_out_ms: int,
+    outline_col: str,
+    shimmer_outline: str | None,
+    loop_ms: int,
+    period_ms: int = 1200,
+) -> str:
+    """
+    Build long-running sparkle tags by repeating pulses until loop_ms.
+    """
+    # Base: fade + a soft glow baseline
+    tags = f"\\fad({fade_in_ms},{fade_out_ms})\\blur2\\be1\\fscx100\\fscy100"
+    t = 0
+    while t + period_ms <= loop_ms:
+        # up then back
+        tags += f"\\t({t},{t+period_ms//2},\\blur7\\be2\\fscx104\\fscy104)"
+        tags += f"\\t({t+period_ms//2},{t+period_ms},\\blur2\\be1\\fscx100\\fscy100)"
+        if shimmer_outline and shimmer_outline != outline_col:
+            # IMPORTANT: emit "\3c" literally as "\\\\3c" in python string
+            tags += f"\\t({t},{t+period_ms//2},\\\\3c{shimmer_outline})\\t({t+period_ms//2},{t+period_ms},\\\\3c{outline_col})"
+        t += period_ms
+    return tags
+
+
+def _make_wave_letter_dialogues(
+    text: str,
+    style_name: str,
+    play_w: int,
+    play_h: int,
+    size: int,
+    wave_cfg: dict,
+    layer: int = 10,
+) -> str:
+    """
+    Create per-letter Dialogue lines with staggered pulse timing to simulate a wave.
+    This is a font-width approximation (good enough for bold display names).
+    """
+    # Layout config (4K defaults)
+    center_x = int(wave_cfg.get("center_x", play_w // 2))
+    center_y = int(wave_cfg.get("center_y", play_h // 2))
+    letter_spacing = float(wave_cfg.get("letter_spacing", 18))
+    width_factor = float(wave_cfg.get("approx_char_width_factor", 0.62))
+
+    amplitude = float(wave_cfg.get("amplitude_px", 40))
+    scale_peak = float(wave_cfg.get("scale_peak", 112))  # percent
+
+    step_ms = int(wave_cfg.get("step_ms", 120))          # delay between letters
+    pulse_ms = int(wave_cfg.get("pulse_ms", 900))        # duration of each letter pulse
+    loop_ms = int(wave_cfg.get("loop_ms", 240000))       # how long to keep waving
+
+    # Approx char advance
+    adv = size * width_factor + letter_spacing
+
+    # Compute total width (approx) including spaces (treat space as 0.5 adv)
+    advances = []
+    for ch in text:
+        if ch == " ":
+            advances.append(adv * 0.5)
+        else:
+            advances.append(adv)
+    total_w = sum(advances)
+
+    start_x = center_x - total_w / 2.0
+
+    # We will build repeated pulses per letter (offset by i*step_ms)
+    # Use \pos for stable placement, and \t segments to simulate bob + scale.
+    # Vertical bob: y +/- amplitude.
+    dialogues = []
+    running_x = start_x
+
+    for i, ch in enumerate(text):
+        # Skip empty?
+        if ch == "":
+            continue
+
+        # Position for this glyph
+        x = int(round(running_x + advances[i] / 2.0))
+        y0 = int(round(center_y))
+        y_up = int(round(center_y - amplitude))
+        y_dn = int(round(center_y))
+
+        # For spaces, we don't render, just advance
+        if ch == " ":
+            running_x += advances[i]
+            continue
+
+        # Build tags
+        # We use \an5 center, \pos(x,y), then repeated \t segments.
+        # For bobbing: we fake it by changing \pos with \t using \move is clunky,
+        # so instead we animate \fscy + \fscx + a slight baseline shift with \t and \yshad? (not reliable).
+        # The most reliable "movement" is to use \move with a short window.
+        #
+        # We'll do: move from y0 -> y_up -> y0 each pulse window.
+        #
+        # \move(x1,y1,x2,y2,t1,t2) runs over a time interval.
+        # We chain two moves per pulse: up then down.
+        #
+        base = f"\\an5\\pos({x},{y0})"
+
+        # pulses
+        t0 = i * step_ms
+        t = t0
+        pulse_tags = ""
+        while t + pulse_ms <= loop_ms:
+            half = pulse_ms // 2
+            # Move up first half, down second half
+            pulse_tags += f"\\move({x},{y0},{x},{y_up},{t},{t+half})"
+            pulse_tags += f"\\move({x},{y_up},{x},{y_dn},{t+half},{t+pulse_ms})"
+            # Scale up then back
+            pulse_tags += f"\\t({t},{t+half},\\fscx{scale_peak:.0f}\\fscy{scale_peak:.0f})"
+            pulse_tags += f"\\t({t+half},{t+pulse_ms},\\fscx100\\fscy100)"
+            t += pulse_ms
+
+        tags = f"{{{base}{pulse_tags}}}"
+
+        # Long event (whole duration); the time-based tags do the animation
+        start = "0:00:00.00"
+        end = "9:59:59.00"
+        dialogues.append(
+            f"Dialogue: {layer},{start},{end},{style_name},,0000,0000,0000,,{tags}{ch}\n"
         )
 
-        # IMPORTANT: use "\\\\3c" to literally emit "\3c" in the ASS file
-        if shimmer_outline and shimmer_outline != outline_col:
-            pulse += f"\\t(0,600,\\\\3c{shimmer_outline})\\t(600,1200,\\\\3c{outline_col})"
-            pulse += f"\\t(1200,1800,\\\\3c{shimmer_outline})\\t(1800,2400,\\\\3c{outline_col})"
-            pulse += f"\\t(2400,3000,\\\\3c{shimmer_outline})\\t(3000,3600,\\\\3c{outline_col})"
+        running_x += advances[i]
 
-        tags = f"{{\\an{alignment}{pos_tag}{rot_tag}{pulse}}}"
-    else:
-        # ✅ fixed: no extra brace at the end
-        tags = f"{{\\an{alignment}{pos_tag}{rot_tag}\\fad({fade_in_ms},{fade_out_ms})}}"
+    return "".join(dialogues)
 
-    dialogue = (
+
+def _make_name_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
+    """
+    Generates an ASS file to overlay a big animated name.
+    Supports:
+      - sparkle_glow (single line, repeated pulses over loop_ms)
+      - wave_letters (per-letter wave animation)
+    """
+    text = str(cfg.get("text", "")).strip()
+    if not text:
+        raise ValueError("name_overlay.text is required")
+
+    font = cfg.get("font", "Montserrat ExtraBold")
+    size = int(cfg.get("size", 300))
+    outline = float(cfg.get("outline", 20))
+    shadow = float(cfg.get("shadow", 0))
+    spacing = float(cfg.get("spacing", 3))
+    alignment = int(cfg.get("alignment", 5))  # 5 = center-middle
+
+    margin_v = int(cfg.get("margin_v", 0))
+    margin_l = int(cfg.get("margin_l", 0))
+    margin_r = int(cfg.get("margin_r", 0))
+
+    primary = _normalize_ass_color(cfg.get("color"), "&H00FFFFFF&")
+    secondary = _normalize_ass_color(cfg.get("secondary_color"), "&H0033CCFF&")
+    outline_col = _normalize_ass_color(cfg.get("outline_color"), "&H00000000&")
+    back_col = _normalize_ass_color(cfg.get("back_color"), "&H00000000&")
+
+    fade_in_ms = int(cfg.get("fade_in_ms", 500))
+    fade_out_ms = int(cfg.get("fade_out_ms", 900))
+    rotate = float(cfg.get("rotate_deg", 0))  # keep straight by default
+    rot_tag = f"\\frz{rotate}" if rotate else ""
+
+    anim = str(cfg.get("animation", "sparkle_glow")).strip().lower()
+    loop_ms = int(cfg.get("loop_ms", 240000))
+
+    header = _ensure_ass_header(play_w, play_h)
+
+    # One style for the name
+    style_line = _make_style_line(
+        name="NAME",
+        font=font,
+        size=size,
+        primary=primary,
+        secondary=secondary,
+        outline_col=outline_col,
+        back_col=back_col,
+        spacing=spacing,
+        outline=outline,
+        shadow=shadow,
+        alignment=alignment,
+        margin_l=margin_l,
+        margin_r=margin_r,
+        margin_v=margin_v,
+    )
+
+    styles = style_line + "\n"
+
+    events_header = (
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    if anim == "wave_letters":
+        wave_cfg = cfg.get("wave", {}) or {}
+
+        # Optional position override for wave
+        # If user provided x/y, interpret as center for the wave block
+        x = cfg.get("x")
+        y = cfg.get("y")
+        if x is not None and y is not None:
+            wave_cfg = dict(wave_cfg)
+            wave_cfg["center_x"] = int(x)
+            wave_cfg["center_y"] = int(y)
+
+        dialogues = _make_wave_letter_dialogues(
+            text=text,
+            style_name="NAME",
+            play_w=play_w,
+            play_h=play_h,
+            size=size,
+            wave_cfg=wave_cfg,
+            layer=10,
+        )
+        ass = header + styles + events_header + dialogues
+        return ass
+
+    # Default: sparkle_glow on a single Dialogue line
+    shimmer_outline = cfg.get("shimmer_outline_color")
+    shimmer_outline = _normalize_ass_color(shimmer_outline, outline_col) if shimmer_outline else None
+
+    sparkle_tags = _sparkle_glow_tags(
+        fade_in_ms=fade_in_ms,
+        fade_out_ms=fade_out_ms,
+        outline_col=outline_col,
+        shimmer_outline=shimmer_outline,
+        loop_ms=loop_ms,
+        period_ms=int(cfg.get("sparkle_period_ms", 1200)),
+    )
+
+    # Optional explicit position (otherwise rely on alignment)
+    x = cfg.get("x")
+    y = cfg.get("y")
+    pos_tag = f"\\pos({int(x)},{int(y)})" if x is not None and y is not None else ""
+
+    tags = f"{{\\an{alignment}{pos_tag}{rot_tag}{sparkle_tags}}}"
+
+    dialogue = (
         f"Dialogue: 10,0:00:00.00,9:59:59.00,NAME,,0000,0000,0000,,{tags}{text}\n"
     )
 
-    ass = _ensure_ass_header(play_w, play_h)
-    ass += style_line
-    ass += "\n"
-    ass += dialogue
+    ass = header + styles + events_header + dialogue
     return ass
 
 
@@ -255,14 +470,17 @@ def handler(event):
         a_bitrate = audio_cfg.get("bitrate", "192k")
         a_volume = audio_cfg.get("volume", None)
 
+        # Download inputs
         download_from_r2(video_key, TMP_IN)
         download_from_r2(ass_key, TMP_ASS)
         download_from_r2(music_key, TMP_MUSIC)
 
+        # Build video filtergraph
         filters = []
         if v_scale:
             filters.append(f"scale={v_scale}")
 
+        # Burn karaoke subtitles + optional force_style
         force_style = subs_cfg.get("force_style", None)
         subs_filter = f"subtitles={TMP_ASS}"
         if isinstance(force_style, dict) and force_style:
@@ -270,6 +488,7 @@ def handler(event):
             subs_filter += f":force_style='{_escape_for_subtitles_filter(fs)}'"
         filters.append(subs_filter)
 
+        # Name overlay as second subtitles pass
         name_overlay_used = False
         if isinstance(name_cfg, dict) and str(name_cfg.get("text", "")).strip():
             ass_text = _make_name_overlay_ass(name_cfg, play_w, play_h)
@@ -280,10 +499,12 @@ def handler(event):
 
         vf = ",".join(filters)
 
+        # Audio filter
         af = None
         if a_volume is not None:
             af = f"volume={float(a_volume)}"
 
+        # ffmpeg command
         cmd = ["ffmpeg", "-y"]
         if loop_video:
             cmd += ["-stream_loop", "-1", "-i", TMP_IN]
