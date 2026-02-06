@@ -409,10 +409,12 @@ def handler(event):
 
         vf = ",".join(filters)
 
-        # 4) Audio filter
-        af = None
+        # 4) Audio filter  ✅ ONLY CHANGE: add aresample=async=1 (and keep volume)
+        af_parts = []
         if a_volume is not None:
-            af = f"volume={float(a_volume)}"
+            af_parts.append(f"volume={float(a_volume)}")
+        af_parts.append("aresample=async=1")
+        af = ",".join(af_parts) if af_parts else None
 
         # 5) ffmpeg command
         cmd = ["ffmpeg", "-y"]
