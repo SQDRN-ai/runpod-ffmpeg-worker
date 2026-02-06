@@ -1,6 +1,8 @@
 import os
 import subprocess
 import uuid
+import math
+import zipfile
 import runpod
 
 TMP_IN = "/tmp/in.mp4"
@@ -61,13 +63,11 @@ def ensure_dir(path: str):
 
 def unzip_to_dir(zip_path: str, out_dir: str):
     """
-    Uses system unzip (most images have it). If not present, returns a clear error.
+    Pure-python unzip (no system 'unzip' dependency).
     """
     ensure_dir(out_dir)
-    # -o overwrite, -q quiet
-    p = subprocess.run(["unzip", "-o", "-q", zip_path, "-d", out_dir], capture_output=True, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(f"unzip failed: {p.stderr[-2000:] or p.stdout[-2000:]}")
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(out_dir)
 
 
 def _build_force_style(force_style: dict) -> str:
@@ -85,16 +85,8 @@ def _escape_for_subtitles_filter(value: str) -> str:
 
 
 # -----------------------------
-# Name overlay ASS generator (unchanged from your working version)
-# (Keep your current wave_letters/sparkle_glow code here.)
-# For brevity, this example assumes you already have:
-#   _make_name_overlay_ass(cfg, play_w, play_h)
-#   _get_canvas(render)
-# from your current working handler.
+# ASS helpers (name overlay)
 # -----------------------------
-
-# ---- BEGIN: minimal name overlay implementation (sparkle_glow only) ----
-# If you already have wave_letters + sparkle_glow in your handler, keep that code instead.
 def _ensure_ass_header(play_w: int, play_h: int) -> str:
     return (
         "[Script Info]\n"
@@ -111,36 +103,192 @@ def _ensure_ass_header(play_w: int, play_h: int) -> str:
     )
 
 
+def _make_style_line(
+    name: str,
+    font: str,
+    size: int,
+    primary: str,
+    secondary: str,
+    outline_col: str,
+    back_col: str,
+    spacing: float,
+    outline: float,
+    shadow: float,
+    alignment: int,
+    margin_l: int,
+    margin_r: int,
+    margin_v: int,
+) -> str:
+    return (
+        "Style: {nm}, {font}, {size}, {pri}, {sec}, {olc}, {bac}, "
+        "1,0,0,0, 100,100, {sp}, 0, 1, {ol}, {sh}, {an}, {ml}, {mr}, {mv}, 1\n"
+    ).format(
+        nm=name,
+        font=font,
+        size=size,
+        pri=primary,
+        sec=secondary,
+        olc=outline_col,
+        bac=back_col,
+        sp=spacing,
+        ol=outline,
+        sh=shadow,
+        an=alignment,
+        ml=margin_l,
+        mr=margin_r,
+        mv=margin_v,
+    )
+
+
+def _make_wave_letter_dialogues(
+    text: str,
+    style_name: str,
+    play_w: int,
+    play_h: int,
+    size: int,
+    wave_cfg: dict,
+    layer: int = 10,
+) -> str:
+    """
+    Create per-letter Dialogue lines with staggered pulse timing to simulate a wave.
+    Font width is approximated (works well for short names).
+    """
+    center_x = int(wave_cfg.get("center_x", play_w // 2))
+    center_y = int(wave_cfg.get("center_y", play_h // 2))
+    letter_spacing = float(wave_cfg.get("letter_spacing", 18))
+    width_factor = float(wave_cfg.get("approx_char_width_factor", 0.62))
+
+    amplitude = float(wave_cfg.get("amplitude_px", 40))
+    scale_peak = float(wave_cfg.get("scale_peak", 112))  # percent
+
+    step_ms = int(wave_cfg.get("step_ms", 120))          # delay between letters
+    pulse_ms = int(wave_cfg.get("pulse_ms", 900))        # duration of each letter pulse
+    loop_ms = int(wave_cfg.get("loop_ms", 240000))       # how long to keep waving
+
+    adv = size * width_factor + letter_spacing
+
+    advances = []
+    for ch in text:
+        advances.append(adv * 0.5 if ch == " " else adv)
+
+    total_w = sum(advances)
+    start_x = center_x - total_w / 2.0
+
+    dialogues = []
+    running_x = start_x
+
+    for i, ch in enumerate(text):
+        x = int(round(running_x + advances[i] / 2.0))
+        y0 = int(round(center_y))
+        y_up = int(round(center_y - amplitude))
+        y_dn = int(round(center_y))
+
+        if ch == " ":
+            running_x += advances[i]
+            continue
+
+        base = f"\\an5\\pos({x},{y0})"
+
+        t0 = i * step_ms
+        t = t0
+        pulse_tags = ""
+        while t + pulse_ms <= loop_ms:
+            half = pulse_ms // 2
+            pulse_tags += f"\\move({x},{y0},{x},{y_up},{t},{t+half})"
+            pulse_tags += f"\\move({x},{y_up},{x},{y_dn},{t+half},{t+pulse_ms})"
+            pulse_tags += f"\\t({t},{t+half},\\fscx{scale_peak:.0f}\\fscy{scale_peak:.0f})"
+            pulse_tags += f"\\t({t+half},{t+pulse_ms},\\fscx100\\fscy100)"
+            t += pulse_ms
+
+        tags = f"{{{base}{pulse_tags}}}"
+        dialogues.append(
+            f"Dialogue: {layer},0:00:00.00,9:59:59.00,{style_name},,0000,0000,0000,,{tags}{ch}\n"
+        )
+
+        running_x += advances[i]
+
+    return "".join(dialogues)
+
+
 def _make_name_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
     text = str(cfg.get("text", "")).strip()
     if not text:
         raise ValueError("name_overlay.text is required")
 
-    # Simple static name overlay (your existing wave_letters code can stay instead)
+    anim = str(cfg.get("animation", "wave_letters")).strip().lower()
+
     font = cfg.get("font", "Montserrat ExtraBold")
     size = int(cfg.get("size", 300))
+    outline = float(cfg.get("outline", 20))
+    shadow = float(cfg.get("shadow", 0))
+    spacing = float(cfg.get("spacing", 3))
     alignment = int(cfg.get("alignment", 5))
 
-    style = (
-        "Style: NAME, {font}, {size}, &H00FFFFFF&, &H00FFFFFF&, &H00000000&, &H00000000&, "
-        "1,0,0,0, 100,100, 0, 0, 1, 20, 0, {an}, 0, 0, 0, 1\n"
-    ).format(font=font, size=size, an=alignment)
+    margin_v = int(cfg.get("margin_v", 0))
+    margin_l = int(cfg.get("margin_l", 0))
+    margin_r = int(cfg.get("margin_r", 0))
 
-    events = (
+    primary = str(cfg.get("color", "&H00FFFFFF&"))
+    secondary = str(cfg.get("secondary_color", "&H0033CCFF&"))
+    outline_col = str(cfg.get("outline_color", "&H00000000&"))
+    back_col = str(cfg.get("back_color", "&H00000000&"))
+
+    header = _ensure_ass_header(play_w, play_h)
+    styles = _make_style_line(
+        name="NAME",
+        font=font,
+        size=size,
+        primary=primary,
+        secondary=secondary,
+        outline_col=outline_col,
+        back_col=back_col,
+        spacing=spacing,
+        outline=outline,
+        shadow=shadow,
+        alignment=alignment,
+        margin_l=margin_l,
+        margin_r=margin_r,
+        margin_v=margin_v,
+    ) + "\n"
+
+    events_header = (
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-        f"Dialogue: 10,0:00:00.00,9:59:59.00,NAME,,0000,0000,0000,,{{\\an{alignment}}}{text}\n"
     )
 
-    return _ensure_ass_header(play_w, play_h) + style + "\n" + events
+    if anim == "wave_letters":
+        wave_cfg = cfg.get("wave", {}) or {}
+        x = cfg.get("x")
+        y = cfg.get("y")
+        if x is not None and y is not None:
+            wave_cfg = dict(wave_cfg)
+            wave_cfg["center_x"] = int(x)
+            wave_cfg["center_y"] = int(y)
+
+        dialogues = _make_wave_letter_dialogues(
+            text=text,
+            style_name="NAME",
+            play_w=play_w,
+            play_h=play_h,
+            size=size,
+            wave_cfg=wave_cfg,
+            layer=10,
+        )
+        return header + styles + events_header + dialogues
+
+    # Fallback: static name (if you ever switch animation type)
+    tags = f"{{\\an{alignment}}}"
+    dialogue = f"Dialogue: 10,0:00:00.00,9:59:59.00,NAME,,0000,0000,0000,,{tags}{text}\n"
+    return header + styles + events_header + dialogue
 
 
 def _get_canvas(render: dict):
     canvas = render.get("canvas", {}) or {}
     w = int(canvas.get("width", 3840))
     h = int(canvas.get("height", 2160))
+    if w <= 0 or h <= 0:
+        raise ValueError("render.canvas.width/height must be positive integers")
     return w, h
-# ---- END: minimal name overlay implementation ----
 
 
 # -----------------------------
@@ -162,7 +310,11 @@ def handler(event):
         )
 
         if not video_key or not ass_key or not music_key:
-            return {"error": "Missing required inputs.", "required": ["video_key", "ass_key", "music_key"]}
+            return {
+                "error": "Missing required inputs.",
+                "required": ["video_key", "ass_key", "music_key"],
+                "got": {"video_key": bool(video_key), "ass_key": bool(ass_key), "music_key": bool(music_key)},
+            }
 
         render = inp.get("render", {}) or {}
         subs_cfg = render.get("subtitles", {}) or {}
@@ -194,7 +346,7 @@ def handler(event):
         download_from_r2(ass_key, TMP_ASS)
         download_from_r2(music_key, TMP_MUSIC)
 
-        # 2) Optional fonts.zip -> /tmp/fonts
+        # 2) Optional fonts.zip -> /tmp/fonts using pure python unzip
         fontsdir = None
         zip_key = fonts_cfg.get("zip_key")
         local_dir = fonts_cfg.get("local_dir", "/tmp/fonts")
@@ -280,6 +432,7 @@ def handler(event):
                 "cmd": cmd,
             }
 
+        # 6) Upload output
         uploaded = upload_to_r2(TMP_OUT, out_key)
 
         return {
