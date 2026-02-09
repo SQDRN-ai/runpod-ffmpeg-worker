@@ -10,12 +10,9 @@ TMP_MUSIC = "/tmp/music.mp3"
 TMP_NAME_ASS = "/tmp/name_overlay.ass"
 TMP_HB_ASS = "/tmp/happy_birthday_overlay.ass"
 TMP_AFTER_ASS = "/tmp/after_subtitles_overlay.ass"
+TMP_BEFORE_ASS = "/tmp/before_subtitles_overlay.ass"  # ✅ NEW
 TMP_FONTS_ZIP = "/tmp/fonts.zip"
 TMP_OUT = "/tmp/final.mp4"
-
-# ✅ NEW (thumbnail)
-TMP_THUMB_BG = "/tmp/thumb_bg.png"
-TMP_THUMB_OUT = "/tmp/thumb.jpg"
 
 print("✅ handler.py loaded (startup ok)")
 
@@ -73,12 +70,6 @@ def unzip_to_dir(zip_path: str, out_dir: str):
 
 
 def find_fontsdir(root_dir: str) -> str:
-    """
-    Returns a directory that contains .ttf/.otf files.
-    Handles common zip layouts like:
-      - /tmp/fonts/*.ttf
-      - /tmp/fonts/Fonts/*.ttf
-    """
     try:
         for name in os.listdir(root_dir):
             low = name.lower()
@@ -114,35 +105,6 @@ def _escape_for_subtitles_filter(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", r"\'")
 
 
-# ✅ NEW (thumbnail): escape drawtext text
-def _escape_drawtext_text(value: str) -> str:
-    # ffmpeg drawtext escaping: \, :, ', %
-    s = str(value)
-    s = s.replace("\\", "\\\\")
-    s = s.replace(":", "\\:")
-    s = s.replace("'", "\\'")
-    s = s.replace("%", "\\%")
-    return s
-
-
-# ✅ NEW (thumbnail): find a font file by filename inside fontsdir
-def _find_font_file(fontsdir: str, filename: str):
-    if not fontsdir or not filename:
-        return None
-    # allow absolute path
-    if os.path.isabs(filename) and os.path.exists(filename):
-        return filename
-    # walk fontsdir for match
-    try:
-        for root, _, files in os.walk(fontsdir):
-            for f in files:
-                if f.lower() == str(filename).lower():
-                    return os.path.join(root, f)
-    except Exception:
-        pass
-    return None
-
-
 # -----------------------------
 # Duration helpers
 # -----------------------------
@@ -169,6 +131,26 @@ def get_ass_end_seconds(path: str) -> float:
             except Exception:
                 pass
     return max_end
+
+
+def get_ass_start_seconds(path: str) -> float:  # ✅ NEW
+    min_start = None
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if not line.startswith("Dialogue:"):
+                continue
+            # Dialogue: Layer, Start, End, ...
+            parts = line.split(",", 3)
+            if len(parts) < 3:
+                continue
+            start_t = parts[1].strip()
+            try:
+                start_s = ass_time_to_seconds(start_t)
+                if min_start is None or start_s < min_start:
+                    min_start = start_s
+            except Exception:
+                pass
+    return float(min_start) if min_start is not None else 0.0
 
 
 def get_media_duration_seconds(path: str) -> float:
@@ -487,7 +469,6 @@ def handler(event):
         name_cfg = render.get("name_overlay", None)
         hb_cfg = render.get("happy_birthday_overlay", None)
         after_cfg = render.get("after_subtitles_overlay", None)
-        thumb_cfg = render.get("thumbnail", None)  # ✅ NEW
         timing_cfg = render.get("timing", {}) or {}
         fonts_cfg = render.get("fonts", {}) or {}
 
@@ -517,6 +498,7 @@ def handler(event):
 
         # duration cap (existing)
         ass_end = get_ass_end_seconds(TMP_ASS)
+        ass_start = get_ass_start_seconds(TMP_ASS)  # ✅ NEW
         audio_end = get_media_duration_seconds(TMP_MUSIC)
         pad = float(render.get("end_pad_seconds", 0.3))
         duration_cap = max(ass_end, audio_end) + pad if (ass_end > 0 or audio_end > 0) else None
@@ -535,7 +517,6 @@ def handler(event):
         if v_scale:
             filters.append(f"scale={v_scale}")
 
-        # Karaoke subtitles + optional force_style + optional fontsdir
         subs_filter = f"subtitles={TMP_ASS}"
         if fontsdir:
             subs_filter += f":fontsdir={fontsdir}"
@@ -547,7 +528,7 @@ def handler(event):
 
         filters.append(subs_filter)
 
-        # HAPPY BIRTHDAY overlay (existing)
+        # HAPPY BIRTHDAY overlay (unchanged)
         happy_birthday_used = False
         if hb_cfg is True:
             hb_cfg = {}
@@ -586,26 +567,39 @@ def handler(event):
                 filters.append(hb_filter)
                 happy_birthday_used = True
 
-        # after-subtitles overlay (existing)
+        # ✅ UPDATED: show the SAME overlay both BEFORE first subtitle and AFTER last subtitle
+        before_subtitles_used = False  # ✅ NEW
         after_subtitles_used = False
-        after_subtitles_window = None
-        if duration_cap is not None:
-            if after_cfg is True:
-                after_cfg = {}
-            if isinstance(after_cfg, dict):
-                enabled = bool(after_cfg.get("enabled", True))
-                min_seconds = float(after_cfg.get("min_seconds", 2.0))
-                start_s = float(after_cfg.get("start_seconds", ass_end))
-                end_s = float(after_cfg.get("end_seconds", duration_cap))
+        before_window = None  # ✅ NEW
+        after_window = None
 
-                start_s = max(0.0, min(start_s, duration_cap))
-                end_s = max(start_s, min(end_s, duration_cap))
+        if after_cfg is True:
+            after_cfg = {}
+        if isinstance(after_cfg, dict) and duration_cap is not None:
+            enabled = bool(after_cfg.get("enabled", True))
+            min_seconds = float(after_cfg.get("min_seconds", 2.0))
 
-                if enabled and (end_s - start_s) >= min_seconds:
-                    full_cfg = dict(after_cfg)
-                    full_cfg.setdefault("text", "🎉 HAPPY BIRTHDAY 🎉")
+            if enabled:
+                # BEFORE: 0 -> ass_start
+                start_before = 0.0
+                end_before = max(0.0, float(ass_start))
+                if (end_before - start_before) >= min_seconds:
+                    before_ass = _make_timed_static_overlay_ass(after_cfg, play_w, play_h, start_before, end_before)
+                    with open(TMP_BEFORE_ASS, "w", encoding="utf-8") as f:
+                        f.write(before_ass)
 
-                    after_ass = _make_timed_static_overlay_ass(full_cfg, play_w, play_h, start_s, end_s)
+                    before_filter = f"subtitles={TMP_BEFORE_ASS}"
+                    if fontsdir:
+                        before_filter += f":fontsdir={fontsdir}"
+                    filters.append(before_filter)
+                    before_subtitles_used = True
+                    before_window = {"start": start_before, "end": end_before, "min_seconds": min_seconds}
+
+                # AFTER: ass_end -> duration_cap
+                start_after = max(0.0, float(ass_end))
+                end_after = float(duration_cap)
+                if (end_after - start_after) >= min_seconds:
+                    after_ass = _make_timed_static_overlay_ass(after_cfg, play_w, play_h, start_after, end_after)
                     with open(TMP_AFTER_ASS, "w", encoding="utf-8") as f:
                         f.write(after_ass)
 
@@ -613,11 +607,10 @@ def handler(event):
                     if fontsdir:
                         after_filter += f":fontsdir={fontsdir}"
                     filters.append(after_filter)
-
                     after_subtitles_used = True
-                    after_subtitles_window = {"start": start_s, "end": end_s, "min_seconds": min_seconds}
+                    after_window = {"start": start_after, "end": end_after, "min_seconds": min_seconds}
 
-        # Name overlay ASS (existing)
+        # Name overlay ASS (unchanged)
         name_overlay_used = False
         if isinstance(name_cfg, dict) and str(name_cfg.get("text", "")).strip():
             ass_text = _make_name_overlay_ass(name_cfg, play_w, play_h)
@@ -639,7 +632,7 @@ def handler(event):
         af_parts.append("aresample=async=1")
         af = ",".join(af_parts) if af_parts else None
 
-        # 5) ffmpeg command (video)
+        # 5) ffmpeg command
         cmd = ["ffmpeg", "-y"]
         if loop_video:
             cmd += ["-stream_loop", "-1", "-i", TMP_IN]
@@ -686,121 +679,26 @@ def handler(event):
 
         uploaded = upload_to_r2(TMP_OUT, out_key)
 
-        # ✅ NEW: Thumbnail render (optional)
-        thumb_result = None
-        thumb_cmd = None
-        if thumb_cfg is True:
-            thumb_cfg = {}
-        if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
-            bg_key = thumb_cfg.get("background_key")
-            if not bg_key:
-                return {"error": "thumbnail.enabled is true but thumbnail.background_key is missing"}
-
-            thumb_out_key = thumb_cfg.get("out_key") or (
-                f"jobs/{job_id}/thumb.jpg" if job_id else f"outputs/{uuid.uuid4().hex}.jpg"
-            )
-
-            size_cfg = thumb_cfg.get("size", {}) or {}
-            tw = int(size_cfg.get("width", 1920))
-            th = int(size_cfg.get("height", 1080))
-
-            name_text_cfg = thumb_cfg.get("name_text", {}) or {}
-            thumb_text = str(name_text_cfg.get("text") or (name_cfg.get("text") if isinstance(name_cfg, dict) else "")).strip()
-            if not thumb_text:
-                return {"error": "thumbnail.enabled is true but thumbnail.name_text.text is missing (and name_overlay.text not available)"}
-
-            # download bg
-            download_from_r2(bg_key, TMP_THUMB_BG)
-
-            # drawtext config
-            # recommend: provide fontfile_name inside the zip, like "Roboto-Black.ttf" or "Boogaloo-Regular.ttf"
-            fontfile_name = name_text_cfg.get("fontfile_name")
-            fontfile = name_text_cfg.get("fontfile")  # absolute path allowed too
-            resolved_fontfile = None
-            if fontfile:
-                resolved_fontfile = _find_font_file(fontsdir, fontfile) if fontsdir else (fontfile if os.path.exists(fontfile) else None)
-            if not resolved_fontfile and fontfile_name and fontsdir:
-                resolved_fontfile = _find_font_file(fontsdir, fontfile_name)
-
-            fontsize = int(name_text_cfg.get("fontsize", 220))
-            fontcolor = str(name_text_cfg.get("color", "#FFFFFF"))
-            x_expr = str(name_text_cfg.get("x", "(w-text_w)/2"))
-            y_expr = str(name_text_cfg.get("y", "(h-text_h)/2"))
-
-            borderw = int(name_text_cfg.get("borderw", 0))
-            bordercolor = str(name_text_cfg.get("bordercolor", "white"))
-            shadowx = int(name_text_cfg.get("shadowx", 0))
-            shadowy = int(name_text_cfg.get("shadowy", 0))
-            shadowcolor = str(name_text_cfg.get("shadowcolor", "black@0.0"))
-
-            safe_text = _escape_drawtext_text(thumb_text)
-
-            # scale-to-cover then crop
-            scale_crop = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th}"
-
-            drawtext_parts = []
-            if resolved_fontfile:
-                drawtext_parts.append(f"fontfile='{resolved_fontfile}'")
-            else:
-                # fallback (works only if the font is installed/known to fontconfig)
-                fontname = str(name_text_cfg.get("font", "Roboto Black"))
-                drawtext_parts.append(f"font='{fontname}'")
-
-            drawtext_parts += [
-                f"text='{safe_text}'",
-                f"fontsize={fontsize}",
-                f"fontcolor={fontcolor}",
-                f"x={x_expr}",
-                f"y={y_expr}",
-                f"borderw={borderw}",
-                f"bordercolor={bordercolor}",
-                f"shadowx={shadowx}",
-                f"shadowy={shadowy}",
-                f"shadowcolor={shadowcolor}",
-            ]
-
-            vf_thumb = f"{scale_crop},drawtext=" + ":".join(drawtext_parts)
-
-            thumb_cmd = [
-                "ffmpeg", "-y",
-                "-i", TMP_THUMB_BG,
-                "-vf", vf_thumb,
-                "-frames:v", "1",
-                "-q:v", str(int(thumb_cfg.get("jpg_quality", 2))),  # 2 = high quality, bigger file
-                TMP_THUMB_OUT
-            ]
-
-            tp = subprocess.run(thumb_cmd, capture_output=True, text=True)
-            if tp.returncode != 0:
-                return {
-                    "error": "thumbnail ffmpeg failed",
-                    "returncode": tp.returncode,
-                    "stderr": tp.stderr[-20000:],
-                    "stdout": tp.stdout[-20000:],
-                    "cmd": thumb_cmd,
-                }
-
-            thumb_result = upload_to_r2(TMP_THUMB_OUT, thumb_out_key)
-
         return {
             "status": "ok",
             "jobId": job_id,
             "out_key": out_key,
             "uploaded": uploaded,
-            "thumbnail_uploaded": thumb_result,          # ✅ NEW
-            "thumbnail_ffmpeg_cmd": thumb_cmd,          # ✅ NEW
             "fontsdir_used": fontsdir,
             "happy_birthday_used": happy_birthday_used,
-            "after_subtitles_used": after_subtitles_used,
-            "after_subtitles_window": after_subtitles_window,
             "name_overlay_used": name_overlay_used,
             "ffmpeg_cmd": cmd,
             "ffmpeg_stderr_tail": p.stderr[-20000:],
             "canvas": {"width": play_w, "height": play_h},
             "timing": {"loop_video": loop_video},
             "duration_cap_seconds": duration_cap,
+            "ass_start_seconds": ass_start,  # ✅ NEW
             "ass_end_seconds": ass_end,
             "audio_end_seconds": audio_end,
+            "before_subtitles_used": before_subtitles_used,          # ✅ NEW
+            "after_subtitles_used": after_subtitles_used,
+            "before_subtitles_window": before_window,               # ✅ NEW
+            "after_subtitles_window": after_window,
         }
 
     except Exception as e:
