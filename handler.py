@@ -9,9 +9,13 @@ TMP_ASS = "/tmp/subtitles.ass"
 TMP_MUSIC = "/tmp/music.mp3"
 TMP_NAME_ASS = "/tmp/name_overlay.ass"
 TMP_HB_ASS = "/tmp/happy_birthday_overlay.ass"
-TMP_AFTER_ASS = "/tmp/after_subtitles_overlay.ass"  # ✅ NEW
+TMP_AFTER_ASS = "/tmp/after_subtitles_overlay.ass"
 TMP_FONTS_ZIP = "/tmp/fonts.zip"
 TMP_OUT = "/tmp/final.mp4"
+
+# ✅ NEW (thumbnail)
+TMP_THUMB_BG = "/tmp/thumb_bg.png"
+TMP_THUMB_OUT = "/tmp/thumb.jpg"
 
 print("✅ handler.py loaded (startup ok)")
 
@@ -75,7 +79,6 @@ def find_fontsdir(root_dir: str) -> str:
       - /tmp/fonts/*.ttf
       - /tmp/fonts/Fonts/*.ttf
     """
-    # If root already contains fonts, use it
     try:
         for name in os.listdir(root_dir):
             low = name.lower()
@@ -84,7 +87,6 @@ def find_fontsdir(root_dir: str) -> str:
     except FileNotFoundError:
         return root_dir
 
-    # Otherwise, look one level down
     try:
         for name in os.listdir(root_dir):
             sub = os.path.join(root_dir, name)
@@ -112,11 +114,39 @@ def _escape_for_subtitles_filter(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", r"\'")
 
 
+# ✅ NEW (thumbnail): escape drawtext text
+def _escape_drawtext_text(value: str) -> str:
+    # ffmpeg drawtext escaping: \, :, ', %
+    s = str(value)
+    s = s.replace("\\", "\\\\")
+    s = s.replace(":", "\\:")
+    s = s.replace("'", "\\'")
+    s = s.replace("%", "\\%")
+    return s
+
+
+# ✅ NEW (thumbnail): find a font file by filename inside fontsdir
+def _find_font_file(fontsdir: str, filename: str):
+    if not fontsdir or not filename:
+        return None
+    # allow absolute path
+    if os.path.isabs(filename) and os.path.exists(filename):
+        return filename
+    # walk fontsdir for match
+    try:
+        for root, _, files in os.walk(fontsdir):
+            for f in files:
+                if f.lower() == str(filename).lower():
+                    return os.path.join(root, f)
+    except Exception:
+        pass
+    return None
+
+
 # -----------------------------
 # Duration helpers
 # -----------------------------
 def ass_time_to_seconds(t: str) -> float:
-    # ASS: H:MM:SS.cs (centiseconds)
     h, m, rest = t.split(":")
     s, cs = rest.split(".")
     return int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100.0
@@ -357,7 +387,6 @@ def _make_name_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
         )
         return header + styles + events_header + dialogues
 
-    # Fallback: static name
     x = cfg.get("x")
     y = cfg.get("y")
     pos_tag = f"\\pos({int(x)},{int(y)})" if (x is not None and y is not None) else ""
@@ -375,7 +404,6 @@ def _get_canvas(render: dict):
     return w, h
 
 
-# ✅ NEW: create a timed overlay ASS that only shows between start_s and end_s
 def _make_timed_static_overlay_ass(cfg: dict, play_w: int, play_h: int, start_s: float, end_s: float) -> str:
     text = str(cfg.get("text", "")).strip()
     if not text:
@@ -458,7 +486,8 @@ def handler(event):
         subs_cfg = render.get("subtitles", {}) or {}
         name_cfg = render.get("name_overlay", None)
         hb_cfg = render.get("happy_birthday_overlay", None)
-        after_cfg = render.get("after_subtitles_overlay", None)  # ✅ NEW
+        after_cfg = render.get("after_subtitles_overlay", None)
+        thumb_cfg = render.get("thumbnail", None)  # ✅ NEW
         timing_cfg = render.get("timing", {}) or {}
         fonts_cfg = render.get("fonts", {}) or {}
 
@@ -557,7 +586,7 @@ def handler(event):
                 filters.append(hb_filter)
                 happy_birthday_used = True
 
-        # ✅ NEW: after-subtitles overlay, only if enough time remains
+        # after-subtitles overlay (existing)
         after_subtitles_used = False
         after_subtitles_window = None
         if duration_cap is not None:
@@ -569,7 +598,6 @@ def handler(event):
                 start_s = float(after_cfg.get("start_seconds", ass_end))
                 end_s = float(after_cfg.get("end_seconds", duration_cap))
 
-                # normalize / clamp
                 start_s = max(0.0, min(start_s, duration_cap))
                 end_s = max(start_s, min(end_s, duration_cap))
 
@@ -611,7 +639,7 @@ def handler(event):
         af_parts.append("aresample=async=1")
         af = ",".join(af_parts) if af_parts else None
 
-        # 5) ffmpeg command
+        # 5) ffmpeg command (video)
         cmd = ["ffmpeg", "-y"]
         if loop_video:
             cmd += ["-stream_loop", "-1", "-i", TMP_IN]
@@ -656,18 +684,115 @@ def handler(event):
                 "cmd": cmd,
             }
 
-        # 6) Upload output
         uploaded = upload_to_r2(TMP_OUT, out_key)
+
+        # ✅ NEW: Thumbnail render (optional)
+        thumb_result = None
+        thumb_cmd = None
+        if thumb_cfg is True:
+            thumb_cfg = {}
+        if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
+            bg_key = thumb_cfg.get("background_key")
+            if not bg_key:
+                return {"error": "thumbnail.enabled is true but thumbnail.background_key is missing"}
+
+            thumb_out_key = thumb_cfg.get("out_key") or (
+                f"jobs/{job_id}/thumb.jpg" if job_id else f"outputs/{uuid.uuid4().hex}.jpg"
+            )
+
+            size_cfg = thumb_cfg.get("size", {}) or {}
+            tw = int(size_cfg.get("width", 1920))
+            th = int(size_cfg.get("height", 1080))
+
+            name_text_cfg = thumb_cfg.get("name_text", {}) or {}
+            thumb_text = str(name_text_cfg.get("text") or (name_cfg.get("text") if isinstance(name_cfg, dict) else "")).strip()
+            if not thumb_text:
+                return {"error": "thumbnail.enabled is true but thumbnail.name_text.text is missing (and name_overlay.text not available)"}
+
+            # download bg
+            download_from_r2(bg_key, TMP_THUMB_BG)
+
+            # drawtext config
+            # recommend: provide fontfile_name inside the zip, like "Roboto-Black.ttf" or "Boogaloo-Regular.ttf"
+            fontfile_name = name_text_cfg.get("fontfile_name")
+            fontfile = name_text_cfg.get("fontfile")  # absolute path allowed too
+            resolved_fontfile = None
+            if fontfile:
+                resolved_fontfile = _find_font_file(fontsdir, fontfile) if fontsdir else (fontfile if os.path.exists(fontfile) else None)
+            if not resolved_fontfile and fontfile_name and fontsdir:
+                resolved_fontfile = _find_font_file(fontsdir, fontfile_name)
+
+            fontsize = int(name_text_cfg.get("fontsize", 220))
+            fontcolor = str(name_text_cfg.get("color", "#FFFFFF"))
+            x_expr = str(name_text_cfg.get("x", "(w-text_w)/2"))
+            y_expr = str(name_text_cfg.get("y", "(h-text_h)/2"))
+
+            borderw = int(name_text_cfg.get("borderw", 0))
+            bordercolor = str(name_text_cfg.get("bordercolor", "white"))
+            shadowx = int(name_text_cfg.get("shadowx", 0))
+            shadowy = int(name_text_cfg.get("shadowy", 0))
+            shadowcolor = str(name_text_cfg.get("shadowcolor", "black@0.0"))
+
+            safe_text = _escape_drawtext_text(thumb_text)
+
+            # scale-to-cover then crop
+            scale_crop = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th}"
+
+            drawtext_parts = []
+            if resolved_fontfile:
+                drawtext_parts.append(f"fontfile='{resolved_fontfile}'")
+            else:
+                # fallback (works only if the font is installed/known to fontconfig)
+                fontname = str(name_text_cfg.get("font", "Roboto Black"))
+                drawtext_parts.append(f"font='{fontname}'")
+
+            drawtext_parts += [
+                f"text='{safe_text}'",
+                f"fontsize={fontsize}",
+                f"fontcolor={fontcolor}",
+                f"x={x_expr}",
+                f"y={y_expr}",
+                f"borderw={borderw}",
+                f"bordercolor={bordercolor}",
+                f"shadowx={shadowx}",
+                f"shadowy={shadowy}",
+                f"shadowcolor={shadowcolor}",
+            ]
+
+            vf_thumb = f"{scale_crop},drawtext=" + ":".join(drawtext_parts)
+
+            thumb_cmd = [
+                "ffmpeg", "-y",
+                "-i", TMP_THUMB_BG,
+                "-vf", vf_thumb,
+                "-frames:v", "1",
+                "-q:v", str(int(thumb_cfg.get("jpg_quality", 2))),  # 2 = high quality, bigger file
+                TMP_THUMB_OUT
+            ]
+
+            tp = subprocess.run(thumb_cmd, capture_output=True, text=True)
+            if tp.returncode != 0:
+                return {
+                    "error": "thumbnail ffmpeg failed",
+                    "returncode": tp.returncode,
+                    "stderr": tp.stderr[-20000:],
+                    "stdout": tp.stdout[-20000:],
+                    "cmd": thumb_cmd,
+                }
+
+            thumb_result = upload_to_r2(TMP_THUMB_OUT, thumb_out_key)
 
         return {
             "status": "ok",
             "jobId": job_id,
             "out_key": out_key,
             "uploaded": uploaded,
+            "thumbnail_uploaded": thumb_result,          # ✅ NEW
+            "thumbnail_ffmpeg_cmd": thumb_cmd,          # ✅ NEW
             "fontsdir_used": fontsdir,
             "happy_birthday_used": happy_birthday_used,
-            "after_subtitles_used": after_subtitles_used,  # ✅ NEW
-            "after_subtitles_window": after_subtitles_window,  # ✅ NEW
+            "after_subtitles_used": after_subtitles_used,
+            "after_subtitles_window": after_subtitles_window,
             "name_overlay_used": name_overlay_used,
             "ffmpeg_cmd": cmd,
             "ffmpeg_stderr_tail": p.stderr[-20000:],
