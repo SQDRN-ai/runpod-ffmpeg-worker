@@ -479,16 +479,176 @@ def _get_canvas(render: dict):
 
 
 # -----------------------------
+# Thumbnail renderer (extracted, used by both modes)
+# -----------------------------
+def _render_thumbnail(
+    *,
+    thumb_cfg: dict,
+    job_id,
+    name_cfg,
+    fontsdir: str,
+):
+    """
+    Renders thumbnail if thumb_cfg.enabled is True.
+    Returns (thumb_result, thumb_cmd).
+    """
+    thumb_result = None
+    thumb_cmd = None
+
+    if thumb_cfg is True:
+        thumb_cfg = {}
+    if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
+        bg_key = thumb_cfg.get("background_key")
+        if not bg_key:
+            raise ValueError("thumbnail.enabled is true but thumbnail.background_key is missing")
+
+        thumb_out_key = thumb_cfg.get("out_key") or (
+            f"jobs/{job_id}/thumb.jpg" if job_id else f"outputs/{uuid.uuid4().hex}.jpg"
+        )
+
+        size_cfg = thumb_cfg.get("size", {}) or {}
+        tw = int(size_cfg.get("width", 1920))
+        th = int(size_cfg.get("height", 1080))
+
+        name_text_cfg = thumb_cfg.get("name_text", {}) or {}
+        thumb_text = str(
+            name_text_cfg.get("text")
+            or (name_cfg.get("text") if isinstance(name_cfg, dict) else "")
+        ).strip()
+        if not thumb_text:
+            raise ValueError(
+                "thumbnail.enabled is true but thumbnail.name_text.text is missing (and name_overlay.text not available)"
+            )
+
+        # download bg
+        download_from_r2(bg_key, TMP_THUMB_BG)
+
+        # drawtext config
+        fontfile_name = name_text_cfg.get("fontfile_name")
+        fontfile = name_text_cfg.get("fontfile")  # absolute path allowed too
+        resolved_fontfile = None
+        if fontfile:
+            resolved_fontfile = _find_font_file(fontsdir, fontfile) if fontsdir else (fontfile if os.path.exists(fontfile) else None)
+        if not resolved_fontfile and fontfile_name and fontsdir:
+            resolved_fontfile = _find_font_file(fontsdir, fontfile_name)
+
+        fontsize = int(name_text_cfg.get("fontsize", 220))
+        fontcolor = str(name_text_cfg.get("color", "#FFFFFF"))
+        x_expr = str(name_text_cfg.get("x", "(w-text_w)/2"))
+        y_expr = str(name_text_cfg.get("y", "(h-text_h)/2"))
+
+        borderw = int(name_text_cfg.get("borderw", 0))
+        bordercolor = str(name_text_cfg.get("bordercolor", "white"))
+        shadowx = int(name_text_cfg.get("shadowx", 0))
+        shadowy = int(name_text_cfg.get("shadowy", 0))
+        shadowcolor = str(name_text_cfg.get("shadowcolor", "black@0.0"))
+
+        safe_text = _escape_drawtext_text(thumb_text)
+
+        # scale-to-cover then crop
+        scale_crop = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th}"
+
+        drawtext_parts = []
+        if resolved_fontfile:
+            drawtext_parts.append(f"fontfile='{resolved_fontfile}'")
+        else:
+            # fallback (works only if the font is installed/known to fontconfig)
+            fontname = str(name_text_cfg.get("font", "Roboto Black"))
+            drawtext_parts.append(f"font='{fontname}'")
+
+        drawtext_parts += [
+            f"text='{safe_text}'",
+            f"fontsize={fontsize}",
+            f"fontcolor={fontcolor}",
+            f"x={x_expr}",
+            f"y={y_expr}",
+            f"borderw={borderw}",
+            f"bordercolor={bordercolor}",
+            f"shadowx={shadowx}",
+            f"shadowy={shadowy}",
+            f"shadowcolor={shadowcolor}",
+        ]
+
+        vf_thumb = f"{scale_crop},drawtext=" + ":".join(drawtext_parts)
+
+        thumb_cmd = [
+            "ffmpeg", "-y",
+            "-i", TMP_THUMB_BG,
+            "-vf", vf_thumb,
+            "-frames:v", "1",
+            "-q:v", str(int(thumb_cfg.get("jpg_quality", 2))),  # 2 = high quality (bigger file)
+            TMP_THUMB_OUT
+        ]
+
+        tp = subprocess.run(thumb_cmd, capture_output=True, text=True)
+        if tp.returncode != 0:
+            raise RuntimeError(
+                "thumbnail ffmpeg failed\n"
+                f"returncode={tp.returncode}\n"
+                f"stderr_tail={tp.stderr[-20000:]}\n"
+                f"stdout_tail={tp.stdout[-20000:]}\n"
+                f"cmd={thumb_cmd}"
+            )
+
+        thumb_result = upload_to_r2(TMP_THUMB_OUT, thumb_out_key)
+
+    return thumb_result, thumb_cmd
+
+
+# -----------------------------
 # Main handler
 # -----------------------------
 def handler(event):
     try:
         inp = (event or {}).get("input", {}) or {}
         mode = inp.get("mode", "render")
-        if mode != "render":
-            return {"error": f"Unknown mode: {mode}. Use mode='render'."}
+
+        if mode not in ("render", "thumbnail"):
+            return {"error": f"Unknown mode: {mode}. Use mode='render' or mode='thumbnail'."}
 
         job_id = inp.get("jobId")
+
+        render = inp.get("render", {}) or {}
+        subs_cfg = render.get("subtitles", {}) or {}
+        name_cfg = render.get("name_overlay", None)
+        hb_cfg = render.get("happy_birthday_overlay", None)
+        after_cfg = render.get("after_subtitles_overlay", None)
+        thumb_cfg = render.get("thumbnail", None)
+        timing_cfg = render.get("timing", {}) or {}
+        fonts_cfg = render.get("fonts", {}) or {}
+
+        play_w, play_h = _get_canvas(render)
+
+        # 1) Optional fonts.zip -> /tmp/fonts (pure python unzip)
+        fontsdir = None
+        zip_key = fonts_cfg.get("zip_key")
+        local_dir = fonts_cfg.get("local_dir", "/tmp/fonts")
+        if zip_key:
+            download_from_r2(zip_key, TMP_FONTS_ZIP)
+            unzip_to_dir(TMP_FONTS_ZIP, local_dir)
+            fontsdir = find_fontsdir(local_dir)
+
+        # ✅ THUMBNAIL-ONLY MODE (early return, does NOT render video)
+        if mode == "thumbnail":
+            thumb_result, thumb_cmd = _render_thumbnail(
+                thumb_cfg=thumb_cfg,
+                job_id=job_id,
+                name_cfg=name_cfg,
+                fontsdir=fontsdir,
+            )
+            return {
+                "status": "ok",
+                "mode": "thumbnail",
+                "jobId": job_id,
+                "thumbnail_uploaded": thumb_result,
+                "thumbnail_ffmpeg_cmd": thumb_cmd,
+                "fontsdir_used": fontsdir,
+                "canvas": {"width": play_w, "height": play_h},
+            }
+
+        # -----------------------------
+        # RENDER MODE (existing behavior)
+        # -----------------------------
         video_key = inp.get("video_key")
         ass_key = inp.get("ass_key")
         music_key = inp.get("music_key")
@@ -502,16 +662,6 @@ def handler(event):
                 "required": ["video_key", "ass_key", "music_key"],
             }
 
-        render = inp.get("render", {}) or {}
-        subs_cfg = render.get("subtitles", {}) or {}
-        name_cfg = render.get("name_overlay", None)
-        hb_cfg = render.get("happy_birthday_overlay", None)
-        after_cfg = render.get("after_subtitles_overlay", None)
-        thumb_cfg = render.get("thumbnail", None)
-        timing_cfg = render.get("timing", {}) or {}
-        fonts_cfg = render.get("fonts", {}) or {}
-
-        play_w, play_h = _get_canvas(render)
         loop_video = bool(timing_cfg.get("loop_video", False))
 
         video_cfg = render.get("video", {}) or {}
@@ -541,15 +691,6 @@ def handler(event):
         audio_end = get_media_duration_seconds(TMP_MUSIC)
         pad = float(render.get("end_pad_seconds", 0.3))
         duration_cap = max(ass_end, audio_end) + pad if (ass_end > 0 or audio_end > 0) else None
-
-        # 2) Optional fonts.zip -> /tmp/fonts (pure python unzip)
-        fontsdir = None
-        zip_key = fonts_cfg.get("zip_key")
-        local_dir = fonts_cfg.get("local_dir", "/tmp/fonts")
-        if zip_key:
-            download_from_r2(zip_key, TMP_FONTS_ZIP)
-            unzip_to_dir(TMP_FONTS_ZIP, local_dir)
-            fontsdir = find_fontsdir(local_dir)
 
         # 3) Build video filtergraph
         filters = []
@@ -719,107 +860,31 @@ def handler(event):
 
         uploaded = upload_to_r2(TMP_OUT, out_key)
 
-        # ✅ Thumbnail render (optional)
+        # ✅ Thumbnail render (optional) - unchanged behavior (still runs after video)
         thumb_result = None
         thumb_cmd = None
-
-        if thumb_cfg is True:
-            thumb_cfg = {}
-        if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
-            bg_key = thumb_cfg.get("background_key")
-            if not bg_key:
-                return {"error": "thumbnail.enabled is true but thumbnail.background_key is missing"}
-
-            thumb_out_key = thumb_cfg.get("out_key") or (
-                f"jobs/{job_id}/thumb.jpg" if job_id else f"outputs/{uuid.uuid4().hex}.jpg"
+        try:
+            thumb_result, thumb_cmd = _render_thumbnail(
+                thumb_cfg=thumb_cfg,
+                job_id=job_id,
+                name_cfg=name_cfg,
+                fontsdir=fontsdir,
             )
-
-            size_cfg = thumb_cfg.get("size", {}) or {}
-            tw = int(size_cfg.get("width", 1920))
-            th = int(size_cfg.get("height", 1080))
-
-            name_text_cfg = thumb_cfg.get("name_text", {}) or {}
-            thumb_text = str(
-                name_text_cfg.get("text")
-                or (name_cfg.get("text") if isinstance(name_cfg, dict) else "")
-            ).strip()
-            if not thumb_text:
-                return {"error": "thumbnail.enabled is true but thumbnail.name_text.text is missing (and name_overlay.text not available)"}
-
-            # download bg
-            download_from_r2(bg_key, TMP_THUMB_BG)
-
-            # drawtext config
-            fontfile_name = name_text_cfg.get("fontfile_name")
-            fontfile = name_text_cfg.get("fontfile")  # absolute path allowed too
-            resolved_fontfile = None
-            if fontfile:
-                resolved_fontfile = _find_font_file(fontsdir, fontfile) if fontsdir else (fontfile if os.path.exists(fontfile) else None)
-            if not resolved_fontfile and fontfile_name and fontsdir:
-                resolved_fontfile = _find_font_file(fontsdir, fontfile_name)
-
-            fontsize = int(name_text_cfg.get("fontsize", 220))
-            fontcolor = str(name_text_cfg.get("color", "#FFFFFF"))
-            x_expr = str(name_text_cfg.get("x", "(w-text_w)/2"))
-            y_expr = str(name_text_cfg.get("y", "(h-text_h)/2"))
-
-            borderw = int(name_text_cfg.get("borderw", 0))
-            bordercolor = str(name_text_cfg.get("bordercolor", "white"))
-            shadowx = int(name_text_cfg.get("shadowx", 0))
-            shadowy = int(name_text_cfg.get("shadowy", 0))
-            shadowcolor = str(name_text_cfg.get("shadowcolor", "black@0.0"))
-
-            safe_text = _escape_drawtext_text(thumb_text)
-
-            # scale-to-cover then crop
-            scale_crop = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th}"
-
-            drawtext_parts = []
-            if resolved_fontfile:
-                drawtext_parts.append(f"fontfile='{resolved_fontfile}'")
-            else:
-                # fallback (works only if the font is installed/known to fontconfig)
-                fontname = str(name_text_cfg.get("font", "Roboto Black"))
-                drawtext_parts.append(f"font='{fontname}'")
-
-            drawtext_parts += [
-                f"text='{safe_text}'",
-                f"fontsize={fontsize}",
-                f"fontcolor={fontcolor}",
-                f"x={x_expr}",
-                f"y={y_expr}",
-                f"borderw={borderw}",
-                f"bordercolor={bordercolor}",
-                f"shadowx={shadowx}",
-                f"shadowy={shadowy}",
-                f"shadowcolor={shadowcolor}",
-            ]
-
-            vf_thumb = f"{scale_crop},drawtext=" + ":".join(drawtext_parts)
-
-            thumb_cmd = [
-                "ffmpeg", "-y",
-                "-i", TMP_THUMB_BG,
-                "-vf", vf_thumb,
-                "-frames:v", "1",
-                "-q:v", str(int(thumb_cfg.get("jpg_quality", 2))),  # 2 = high quality (bigger file)
-                TMP_THUMB_OUT
-            ]
-
-            tp = subprocess.run(thumb_cmd, capture_output=True, text=True)
-            if tp.returncode != 0:
-                return {
-                    "error": "thumbnail ffmpeg failed",
-                    "returncode": tp.returncode,
-                    "stderr": tp.stderr[-20000:],
-                    "stdout": tp.stdout[-20000:],
-                    "cmd": thumb_cmd,
-                }
-
-            thumb_result = upload_to_r2(TMP_THUMB_OUT, thumb_out_key)
+        except ValueError as ve:
+            # keep old behavior: previously thumbnail errors returned immediately;
+            # BUT only when enabled. Here, we preserve that by re-raising if enabled=True.
+            # If it's not enabled, _render_thumbnail won't raise.
+            if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
+                return {"error": str(ve)}
+        except RuntimeError as re:
+            if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
+                # match original shape as closely as possible
+                msg = str(re)
+                return {"error": "thumbnail ffmpeg failed", "details": msg}
 
         return {
             "status": "ok",
+            "mode": "render",
             "jobId": job_id,
             "out_key": out_key,
             "uploaded": uploaded,
