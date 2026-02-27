@@ -265,7 +265,7 @@ def shift_ass_dialogue_times(in_path: str, out_path: str, offset_s: float):
 
 
 # -----------------------------
-# Detect leading silence (only to keep subs aligned)
+# Detect leading silence (only for subtitle alignment)
 # -----------------------------
 def detect_leading_silence_seconds(path: str, threshold_db: float, min_silence: float, max_trim: float) -> float:
     """
@@ -794,6 +794,7 @@ def handler(event):
         min_silence = float(trim_cfg.get("min_silence_seconds", 0.08))
         max_leading_trim = float(trim_cfg.get("max_leading_trim_seconds", 2.0))
         end_silence = float(trim_cfg.get("end_silence_seconds", 0.20))
+        subtitle_nudge = float(trim_cfg.get("subtitle_nudge_seconds", 0.0))  # optional fine-tune
 
         lead_trim = 0.0
         if trim_enabled:
@@ -807,7 +808,7 @@ def handler(event):
         # Karaoke ASS shift:
         # - intro adds intro_len delay
         # - trimming removes lead_trim delay
-        effective_ass_shift = (intro_len - lead_trim) if intro_enabled else (-lead_trim)
+        effective_ass_shift = ((intro_len - lead_trim) if intro_enabled else (-lead_trim)) + subtitle_nudge
 
         ass_path_for_render = TMP_ASS
         if abs(effective_ass_shift) > 1e-6:
@@ -819,10 +820,8 @@ def handler(event):
         ass_start = get_ass_start_seconds(ass_path_for_render)
 
         music_dur = get_media_duration_seconds(TMP_MUSIC)
-        effective_song_dur = max(0.0, music_dur - lead_trim)  # end trimming is unknown; -shortest handles it
+        effective_song_dur = max(0.0, music_dur - lead_trim)
         pad = float(render.get("end_pad_seconds", 0.3))
-
-        # total timeline length estimate for overlays
         total_audio_len_est = (intro_len if intro_enabled else 0.0) + effective_song_dur
         duration_cap = max(ass_end, total_audio_len_est) + pad if (ass_end > 0 or total_audio_len_est > 0) else None
 
@@ -955,18 +954,19 @@ def handler(event):
         fc = []
         fc.append(f"[0:v]{vf}[vout]")
 
+        # IMPORTANT: To keep subtitles perfect, we ONLY trim start with atrim(lead_trim),
+        # and only trim end with silenceremove stop_periods.
         def build_song_chain(in_label: str, out_label: str) -> str:
             parts = []
 
-            # Trim start+end only (no mid-track drops)
+            # END-only silence trim (does NOT touch the beginning)
             if trim_enabled:
                 parts.append(
                     "silenceremove="
-                    f"start_periods=1:start_duration={min_silence}:start_threshold={threshold_db}dB:"
                     f"stop_periods=1:stop_duration={end_silence}:stop_threshold={threshold_db}dB"
                 )
 
-            # Ensure exact lead trim so subtitle offset stays perfect
+            # START trim exactly once, using detected lead_trim
             if trim_enabled and lead_trim > 0.0:
                 parts.append(f"atrim=start={lead_trim:.3f}")
                 parts.append("asetpts=PTS-STARTPTS")
@@ -1079,6 +1079,7 @@ def handler(event):
             "normal_text_start_seconds": normal_text_start,
             "trim_enabled": trim_enabled,
             "trimmed_leading_seconds": lead_trim,
+            "subtitle_nudge_seconds": subtitle_nudge,
             "effective_ass_shift_seconds": effective_ass_shift,
             "happy_birthday_used": happy_birthday_used,
             "name_overlay_used": name_overlay_used,
