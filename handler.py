@@ -10,7 +10,7 @@ TMP_SHIFTED_ASS = "/tmp/subtitles_shifted.ass"
 
 TMP_MUSIC = "/tmp/music.mp3"
 
-# ✅ NEW intro audio parts
+# ✅ Intro audio parts
 TMP_INTRO_BGM = "/tmp/intro_bgm.mp3"
 TMP_COUNTDOWN_VO = "/tmp/countdown_vo.mp3"
 TMP_HB_VO = "/tmp/hb_voice.mp3"
@@ -20,7 +20,7 @@ TMP_NAME_ASS = "/tmp/name_overlay.ass"
 TMP_HB_ASS = "/tmp/happy_birthday_overlay.ass"
 TMP_AFTER_ASS = "/tmp/after_subtitles_overlay.ass"
 TMP_BEFORE_ASS = "/tmp/before_subtitles_overlay.ass"
-TMP_COUNTDOWN_ASS = "/tmp/countdown_overlay.ass"  # ✅ NEW
+TMP_COUNTDOWN_ASS = "/tmp/countdown_overlay.ass"
 
 TMP_FONTS_ZIP = "/tmp/fonts.zip"
 TMP_OUT = "/tmp/final.mp4"
@@ -57,7 +57,10 @@ def r2_client():
 def download_from_r2(key: str, local_path: str):
     bucket = os.environ["R2_BUCKET"]
     s3 = r2_client()
-    s3.download_file(bucket, key, local_path)
+    try:
+        s3.download_file(bucket, key, local_path)
+    except Exception as e:
+        raise RuntimeError(f"R2 download failed (bucket={bucket}, key={key}): {e}")
 
 
 def upload_to_r2(local_path: str, key: str):
@@ -129,7 +132,6 @@ def _escape_for_subtitles_filter(value: str) -> str:
 # Thumbnail helpers
 # -----------------------------
 def _escape_drawtext_text(value: str) -> str:
-    # ffmpeg drawtext escaping: \, :, ', %
     s = str(value)
     s = s.replace("\\", "\\\\")
     s = s.replace(":", "\\:")
@@ -157,7 +159,6 @@ def _find_font_file(fontsdir: str, filename: str):
 # Duration helpers
 # -----------------------------
 def ass_time_to_seconds(t: str) -> float:
-    # ASS: H:MM:SS.cs (centiseconds)
     h, m, rest = t.split(":")
     s, cs = rest.split(".")
     return int(h) * 3600 + int(m) * 60 + int(s) + int(cs) / 100.0
@@ -243,16 +244,15 @@ def shift_ass_dialogue_times(in_path: str, out_path: str, offset_s: float):
             out_lines.append(line)
             continue
 
-        # Dialogue: Layer, Start, End, Style, Name, ...
         parts = line.split(",", 3)
         if len(parts) < 4:
             out_lines.append(line)
             continue
 
-        head = parts[0]              # "Dialogue: 0"
+        head = parts[0]
         start_t = parts[1].strip()
         end_t = parts[2].strip()
-        tail = parts[3]              # rest of line from Style onward
+        tail = parts[3]
 
         try:
             start_s = ass_time_to_seconds(start_t) + float(offset_s)
@@ -338,7 +338,7 @@ def _make_wave_letter_dialogues(
     width_factor = float(wave_cfg.get("approx_char_width_factor", 0.62))
 
     amplitude = float(wave_cfg.get("amplitude_px", 40))
-    scale_peak = float(wave_cfg.get("scale_peak", 112))  # percent
+    scale_peak = float(wave_cfg.get("scale_peak", 112))
 
     step_ms = int(wave_cfg.get("step_ms", 120))
     pulse_ms = int(wave_cfg.get("pulse_ms", 900))
@@ -466,7 +466,7 @@ def _make_name_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
 def _make_timed_static_overlay_ass(cfg: dict, play_w: int, play_h: int, start_s: float, end_s: float) -> str:
     text = str(cfg.get("text", "")).strip()
     if not text:
-        raise ValueError("after_subtitles_overlay.text is required")
+        raise ValueError("overlay.text is required")
 
     font = cfg.get("font", "Montserrat SemiBold")
     size = int(cfg.get("size", 180))
@@ -487,7 +487,7 @@ def _make_timed_static_overlay_ass(cfg: dict, play_w: int, play_h: int, start_s:
 
     header = _ensure_ass_header(play_w, play_h)
     styles = _make_style_line(
-        name="AFTER",
+        name="OVER",
         font=font,
         size=size,
         primary=primary,
@@ -512,19 +512,12 @@ def _make_timed_static_overlay_ass(cfg: dict, play_w: int, play_h: int, start_s:
     end_t = seconds_to_ass_time(end_s)
 
     tags = f"{{\\an{alignment}\\pos({int(x)},{int(y)})\\fad({fade_in_ms},{fade_out_ms})}}"
-    dialogue = f"Dialogue: 12,{start_t},{end_t},AFTER,,0000,0000,0000,,{tags}{text}\n"
+    dialogue = f"Dialogue: 12,{start_t},{end_t},OVER,,0000,0000,0000,,{tags}{text}\n"
 
     return header + styles + events_header + dialogue
 
 
 def _make_countdown_overlay_ass(play_w: int, play_h: int) -> str:
-    """
-    Countdown text:
-      3 at 0.0s
-      2 at 0.6s
-      1 at 1.2s
-    Big centered.
-    """
     header = _ensure_ass_header(play_w, play_h)
     styles = _make_style_line(
         name="COUNT",
@@ -554,13 +547,11 @@ def _make_countdown_overlay_ass(play_w: int, play_h: int) -> str:
         tags = f"{{\\an5\\pos({play_w//2},{play_h//2})\\fad(60,120)}}"
         return f"Dialogue: {layer},{st},{et},COUNT,,0000,0000,0000,,{tags}{txt}\n"
 
-    dialogues = (
+    return header + styles + events_header + (
         dlg(50, 0.0, 0.6, "3") +
         dlg(50, 0.6, 1.2, "2") +
         dlg(50, 1.2, 1.8, "1")
     )
-
-    return header + styles + events_header + dialogues
 
 
 def _get_canvas(render: dict):
@@ -576,10 +567,6 @@ def _get_canvas(render: dict):
 # Thumbnail renderer
 # -----------------------------
 def _render_thumbnail(*, thumb_cfg: dict, job_id, name_cfg, fontsdir: str):
-    """
-    Renders thumbnail if thumb_cfg.enabled is True.
-    Returns (thumb_result, thumb_cmd).
-    """
     thumb_result = None
     thumb_cmd = None
 
@@ -611,7 +598,7 @@ def _render_thumbnail(*, thumb_cfg: dict, job_id, name_cfg, fontsdir: str):
         download_from_r2(bg_key, TMP_THUMB_BG)
 
         fontfile_name = name_text_cfg.get("fontfile_name")
-        fontfile = name_text_cfg.get("fontfile")  # absolute path allowed too
+        fontfile = name_text_cfg.get("fontfile")
         resolved_fontfile = None
         if fontfile:
             resolved_fontfile = _find_font_file(fontsdir, fontfile) if fontsdir else (fontfile if os.path.exists(fontfile) else None)
@@ -696,19 +683,28 @@ def handler(event):
         subs_cfg = render.get("subtitles", {}) or {}
         name_cfg = render.get("name_overlay", None)
         hb_cfg = render.get("happy_birthday_overlay", None)
+
+        # ✅ AFTER (post-song) overlay (keep your current text/settings here)
         after_cfg = render.get("after_subtitles_overlay", None)
+
+        # ✅ NEW: BEFORE (pre-song) overlay (different text, starts at 2s)
+        before_cfg = render.get("before_subtitles_overlay", None)
+
         thumb_cfg = render.get("thumbnail", None)
         timing_cfg = render.get("timing", {}) or {}
         fonts_cfg = render.get("fonts", {}) or {}
 
-        # ✅ NEW intro config
+        # ✅ Intro config
         intro_cfg = render.get("intro", {}) or {}
         intro_enabled = bool(intro_cfg.get("enabled", False))
         intro_len = float(intro_cfg.get("length_seconds", 5.0))
 
+        # ✅ When should "normal text" appear? After countdown (default 2.0s)
+        normal_text_start = float(intro_cfg.get("normal_text_start_seconds", 2.0))
+
         play_w, play_h = _get_canvas(render)
 
-        # 1) Optional fonts.zip -> /tmp/fonts
+        # Fonts.zip -> /tmp/fonts
         fontsdir = None
         zip_key = fonts_cfg.get("zip_key")
         local_dir = fonts_cfg.get("local_dir", "/tmp/fonts")
@@ -717,7 +713,7 @@ def handler(event):
             unzip_to_dir(TMP_FONTS_ZIP, local_dir)
             fontsdir = find_fontsdir(local_dir)
 
-        # ✅ THUMBNAIL-ONLY MODE
+        # THUMBNAIL-ONLY MODE
         if mode == "thumbnail":
             thumb_result, thumb_cmd = _render_thumbnail(
                 thumb_cfg=thumb_cfg,
@@ -746,10 +742,7 @@ def handler(event):
         )
 
         if not video_key or not ass_key or not music_key:
-            return {
-                "error": "Missing required inputs.",
-                "required": ["video_key", "ass_key", "music_key"],
-            }
+            return {"error": "Missing required inputs.", "required": ["video_key", "ass_key", "music_key"]}
 
         loop_video = bool(timing_cfg.get("loop_video", False))
 
@@ -769,52 +762,48 @@ def handler(event):
         a_bitrate = audio_cfg.get("bitrate", "192k")
         a_volume = audio_cfg.get("volume", None)
 
-        # 1) Download inputs
+        # Download main inputs
         download_from_r2(video_key, TMP_IN)
         download_from_r2(ass_key, TMP_ASS)
         download_from_r2(music_key, TMP_MUSIC)
 
-        # ✅ NEW intro downloads (from R2 /jobs/...)
+        # Intro downloads (jobs/...)
         if intro_enabled:
-            intro_bgm_key = intro_cfg.get("bgm_key")
-            countdown_key = intro_cfg.get("countdown_key")
-            hb_voice_key = intro_cfg.get("hb_voice_key")
-
             missing = [k for k in ["bgm_key", "countdown_key", "hb_voice_key"] if not intro_cfg.get(k)]
             if missing:
                 return {"error": "intro.enabled is true but missing intro keys", "missing": missing}
 
-            download_from_r2(intro_bgm_key, TMP_INTRO_BGM)
-            download_from_r2(countdown_key, TMP_COUNTDOWN_VO)
-            download_from_r2(hb_voice_key, TMP_HB_VO)
+            download_from_r2(intro_cfg["bgm_key"], TMP_INTRO_BGM)
+            download_from_r2(intro_cfg["countdown_key"], TMP_COUNTDOWN_VO)
+            download_from_r2(intro_cfg["hb_voice_key"], TMP_HB_VO)
 
-        # duration cap (based on old song+ass, then extend by intro_len if enabled)
+        # duration cap (song + ass), then extend by intro_len if enabled
         ass_end = get_ass_end_seconds(TMP_ASS)
         ass_start = get_ass_start_seconds(TMP_ASS)
         audio_end = get_media_duration_seconds(TMP_MUSIC)
         pad = float(render.get("end_pad_seconds", 0.3))
         duration_cap = max(ass_end, audio_end) + pad if (ass_end > 0 or audio_end > 0) else None
 
-        # ✅ Shift karaoke ASS by +intro_len so lyrics still align with song (song starts after intro)
+        # Shift karaoke ASS by +intro_len (because the song audio starts after the 5s intro)
         ass_path_for_render = TMP_ASS
         if intro_enabled and intro_len > 0:
             shift_ass_dialogue_times(TMP_ASS, TMP_SHIFTED_ASS, intro_len)
             ass_path_for_render = TMP_SHIFTED_ASS
 
-            # shift derived timings too (for before/after overlays)
-            ass_end = ass_end + intro_len
-            ass_start = ass_start + intro_len
+            # shift derived timings for "song start/end" windows
+            ass_end += intro_len
+            ass_start += intro_len
             if duration_cap is not None:
-                duration_cap = duration_cap + intro_len
+                duration_cap += intro_len
 
         # -----------------------------
-        # Build VIDEO filtergraph (simple vf string, but will be used inside filter_complex)
+        # VIDEO filters (will be used inside filter_complex)
         # -----------------------------
         vf_filters = []
         if v_scale:
             vf_filters.append(f"scale={v_scale}")
 
-        # Karaoke subtitles + optional force_style + optional fontsdir
+        # Karaoke subtitles
         subs_filter = f"subtitles={ass_path_for_render}"
         if fontsdir:
             subs_filter += f":fontsdir={fontsdir}"
@@ -826,7 +815,7 @@ def handler(event):
 
         vf_filters.append(subs_filter)
 
-        # ✅ NEW: countdown numbers during intro (0.0–1.8s)
+        # Countdown numbers during intro
         if intro_enabled:
             countdown_ass = _make_countdown_overlay_ass(play_w, play_h)
             with open(TMP_COUNTDOWN_ASS, "w", encoding="utf-8") as f:
@@ -837,7 +826,8 @@ def handler(event):
                 cd_filter += f":fontsdir={fontsdir}"
             vf_filters.append(cd_filter)
 
-        # HAPPY BIRTHDAY overlay (above name) — should appear AFTER intro
+        # ✅ HAPPY BIRTHDAY overlay + Name overlay should appear after countdown (default 2s),
+        # not after 5 seconds. So shift these overlays by normal_text_start.
         happy_birthday_used = False
         if hb_cfg is True:
             hb_cfg = {}
@@ -870,9 +860,8 @@ def handler(event):
                 with open(TMP_HB_ASS, "w", encoding="utf-8") as f:
                     f.write(hb_ass)
 
-                # ✅ shift overlay to start after intro
-                if intro_enabled and intro_len > 0:
-                    shift_ass_dialogue_times(TMP_HB_ASS, TMP_HB_ASS, intro_len)
+                if normal_text_start > 0:
+                    shift_ass_dialogue_times(TMP_HB_ASS, TMP_HB_ASS, normal_text_start)
 
                 hb_filter = f"subtitles={TMP_HB_ASS}"
                 if fontsdir:
@@ -880,10 +869,59 @@ def handler(event):
                 vf_filters.append(hb_filter)
                 happy_birthday_used = True
 
-        # BEFORE + AFTER overlays (use shifted ass_start/ass_end when intro enabled)
+        name_overlay_used = False
+        if isinstance(name_cfg, dict) and str(name_cfg.get("text", "")).strip():
+            name_ass = _make_name_overlay_ass(name_cfg, play_w, play_h)
+            with open(TMP_NAME_ASS, "w", encoding="utf-8") as f:
+                f.write(name_ass)
+
+            if normal_text_start > 0:
+                shift_ass_dialogue_times(TMP_NAME_ASS, TMP_NAME_ASS, normal_text_start)
+
+            name_filter = f"subtitles={TMP_NAME_ASS}"
+            if fontsdir:
+                name_filter += f":fontsdir={fontsdir}"
+            vf_filters.append(name_filter)
+            name_overlay_used = True
+
+        # ✅ BEFORE (pre-song) overlay: start at 2s, end at ass_start (same end timing as before)
         before_subtitles_used = False
-        after_subtitles_used = False
         before_subtitles_window = None
+
+        # Keep old behavior if you didn't add before_subtitles_overlay: fall back to after_cfg text
+        effective_before_cfg = None
+        if before_cfg is True:
+            before_cfg = {}
+        if isinstance(before_cfg, dict):
+            effective_before_cfg = dict(before_cfg)
+            effective_before_cfg.setdefault("enabled", True)
+        elif isinstance(after_cfg, dict) and after_cfg is not None:
+            # fallback: use the old config (but you asked to make it adjustable, so prefer before_cfg)
+            effective_before_cfg = None
+
+        if isinstance(effective_before_cfg, dict) and duration_cap is not None:
+            enabled = bool(effective_before_cfg.get("enabled", True))
+            min_seconds = float(effective_before_cfg.get("min_seconds", 0.1))
+
+            if enabled:
+                start_before = max(0.0, float(normal_text_start))
+                end_before = max(start_before, float(ass_start))  # end when song/lyrics begin
+
+                if (end_before - start_before) >= min_seconds:
+                    before_ass = _make_timed_static_overlay_ass(effective_before_cfg, play_w, play_h, start_before, end_before)
+                    with open(TMP_BEFORE_ASS, "w", encoding="utf-8") as f:
+                        f.write(before_ass)
+
+                    before_filter = f"subtitles={TMP_BEFORE_ASS}"
+                    if fontsdir:
+                        before_filter += f":fontsdir={fontsdir}"
+                    vf_filters.append(before_filter)
+
+                    before_subtitles_used = True
+                    before_subtitles_window = {"start": start_before, "end": end_before, "min_seconds": min_seconds}
+
+        # ✅ AFTER (post-song) overlay: keep EXACT current behavior + current text
+        after_subtitles_used = False
         after_subtitles_window = None
 
         if after_cfg is True:
@@ -893,24 +931,9 @@ def handler(event):
             min_seconds = float(after_cfg.get("min_seconds", 2.0))
 
             if enabled:
-                # BEFORE: 0 -> ass_start
-                start_before = 0.0
-                end_before = max(0.0, float(ass_start))
-                if (end_before - start_before) >= min_seconds:
-                    before_ass = _make_timed_static_overlay_ass(after_cfg, play_w, play_h, start_before, end_before)
-                    with open(TMP_BEFORE_ASS, "w", encoding="utf-8") as f:
-                        f.write(before_ass)
-
-                    before_filter = f"subtitles={TMP_BEFORE_ASS}"
-                    if fontsdir:
-                        before_filter += f":fontsdir={fontsdir}"
-                    vf_filters.append(before_filter)
-                    before_subtitles_used = True
-                    before_subtitles_window = {"start": start_before, "end": end_before, "min_seconds": min_seconds}
-
-                # AFTER: ass_end -> duration_cap
                 start_after = max(0.0, float(ass_end))
                 end_after = float(duration_cap)
+
                 if (end_after - start_after) >= min_seconds:
                     after_ass = _make_timed_static_overlay_ass(after_cfg, play_w, play_h, start_after, end_after)
                     with open(TMP_AFTER_ASS, "w", encoding="utf-8") as f:
@@ -920,37 +943,18 @@ def handler(event):
                     if fontsdir:
                         after_filter += f":fontsdir={fontsdir}"
                     vf_filters.append(after_filter)
+
                     after_subtitles_used = True
                     after_subtitles_window = {"start": start_after, "end": end_after, "min_seconds": min_seconds}
-
-        # Name overlay ASS — should appear AFTER intro
-        name_overlay_used = False
-        if isinstance(name_cfg, dict) and str(name_cfg.get("text", "")).strip():
-            ass_text = _make_name_overlay_ass(name_cfg, play_w, play_h)
-            with open(TMP_NAME_ASS, "w", encoding="utf-8") as f:
-                f.write(ass_text)
-
-            # ✅ shift overlay to start after intro
-            if intro_enabled and intro_len > 0:
-                shift_ass_dialogue_times(TMP_NAME_ASS, TMP_NAME_ASS, intro_len)
-
-            name_filter = f"subtitles={TMP_NAME_ASS}"
-            if fontsdir:
-                name_filter += f":fontsdir={fontsdir}"
-            vf_filters.append(name_filter)
-            name_overlay_used = True
 
         vf = ",".join(vf_filters)
 
         # -----------------------------
-        # Build FILTER_COMPLEX (video + audio) so we can prepend intro audio
+        # FILTER_COMPLEX (video + audio)
         # -----------------------------
         filter_complex_parts = []
-
-        # VIDEO: apply vf to input video 0
         filter_complex_parts.append(f"[0:v]{vf}[vout]")
 
-        # AUDIO:
         if not intro_enabled:
             a_chain = []
             if a_volume is not None:
@@ -962,35 +966,29 @@ def handler(event):
             cd_vol = float(intro_cfg.get("countdown_volume", 1.0))
             hb_vol = float(intro_cfg.get("hb_voice_volume", 1.0))
 
-            # Intro bed (trim/pad to intro_len)
             filter_complex_parts.append(
                 f"[2:a]volume={intro_bgm_vol},atrim=0:{intro_len},asetpts=PTS-STARTPTS[introb]"
             )
-            # Countdown VO assumed ~2s
             filter_complex_parts.append(
                 "[3:a]"
                 f"volume={cd_vol},atrim=0:2.0,asetpts=PTS-STARTPTS[countvo]"
             )
-            # HB voice assumed ~3s starting at t=2.0s
             filter_complex_parts.append(
                 "[4:a]"
                 f"volume={hb_vol},atrim=0:3.0,asetpts=PTS-STARTPTS,adelay=2000|2000[hbvo]"
             )
 
-            # Mix intro
             filter_complex_parts.append(
                 "[introb][countvo][hbvo]amix=inputs=3:normalize=0:duration=longest[intromix]"
             )
             filter_complex_parts.append(f"[intromix]atrim=0:{intro_len},asetpts=PTS-STARTPTS[intro]")
 
-            # Main song processing
             main_chain = []
             if a_volume is not None:
                 main_chain.append(f"volume={float(a_volume)}")
             main_chain.append("aresample=async=1")
             filter_complex_parts.append(f"[1:a]{','.join(main_chain)}[song]")
 
-            # Concat intro + song
             filter_complex_parts.append("[intro][song]concat=n=2:v=0:a=1[aout]")
 
         filter_complex = ";".join(filter_complex_parts)
@@ -1000,15 +998,14 @@ def handler(event):
         # -----------------------------
         cmd = ["ffmpeg", "-y"]
 
-        # VIDEO input (looping starts immediately; NO trim)
+        # Video input (looping starts immediately)
         if loop_video:
             cmd += ["-stream_loop", "-1", "-i", TMP_IN]
         else:
             cmd += ["-i", TMP_IN]
 
-        # AUDIO inputs
+        # Audio inputs
         cmd += ["-i", TMP_MUSIC]
-
         if intro_enabled:
             cmd += ["-i", TMP_INTRO_BGM, "-i", TMP_COUNTDOWN_VO, "-i", TMP_HB_VO]
 
@@ -1049,7 +1046,7 @@ def handler(event):
 
         uploaded = upload_to_r2(TMP_OUT, out_key)
 
-        # ✅ Thumbnail render (optional) - unchanged behavior
+        # Thumbnail (optional)
         thumb_result = None
         thumb_cmd = None
         try:
@@ -1075,14 +1072,15 @@ def handler(event):
             "thumbnail_uploaded": thumb_result,
             "thumbnail_ffmpeg_cmd": thumb_cmd,
             "fontsdir_used": fontsdir,
+            "intro_enabled": intro_enabled,
+            "intro_seconds": intro_len if intro_enabled else 0.0,
+            "normal_text_start_seconds": normal_text_start,
             "happy_birthday_used": happy_birthday_used,
             "name_overlay_used": name_overlay_used,
             "before_subtitles_used": before_subtitles_used,
             "after_subtitles_used": after_subtitles_used,
             "before_subtitles_window": before_subtitles_window,
             "after_subtitles_window": after_subtitles_window,
-            "intro_enabled": intro_enabled,
-            "intro_seconds": intro_len if intro_enabled else 0.0,
             "ffmpeg_cmd": cmd,
             "ffmpeg_stderr_tail": p.stderr[-20000:],
             "canvas": {"width": play_w, "height": play_h},
