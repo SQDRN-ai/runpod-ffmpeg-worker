@@ -714,8 +714,12 @@ def handler(event):
 
         intro_cfg = render.get("intro", {}) or {}
         intro_enabled = bool(intro_cfg.get("enabled", False))
-        intro_len = float(intro_cfg.get("length_seconds", 5.0))
+        intro_len_min = float(intro_cfg.get("length_seconds", 5.0))  # minimum intro
         normal_text_start = float(intro_cfg.get("normal_text_start_seconds", 2.0))
+
+        # New optional knobs (default keeps your current behavior)
+        countdown_seconds = float(intro_cfg.get("countdown_seconds", 2.0))
+        hb_voice_delay_seconds = float(intro_cfg.get("hb_voice_delay_seconds", 2.0))
 
         play_w, play_h = _get_canvas(render)
 
@@ -778,14 +782,29 @@ def handler(event):
         download_from_r2(ass_key, TMP_ASS)
         download_from_r2(music_key, TMP_MUSIC)
 
-        # Intro assets
+        hb_voice_dur = 3.0  # fallback
+        intro_len = 0.0
+
+        # Intro assets (and compute dynamic intro length)
         if intro_enabled:
             missing = [k for k in ["bgm_key", "countdown_key", "hb_voice_key"] if not intro_cfg.get(k)]
             if missing:
                 return {"error": "intro.enabled is true but missing intro keys", "missing": missing}
+
             download_from_r2(intro_cfg["bgm_key"], TMP_INTRO_BGM)
             download_from_r2(intro_cfg["countdown_key"], TMP_COUNTDOWN_VO)
             download_from_r2(intro_cfg["hb_voice_key"], TMP_HB_VO)
+
+            hb_voice_dur = max(0.0, get_media_duration_seconds(TMP_HB_VO))
+
+            # ✅ Dynamic intro length: minimum vs spoken audio length
+            intro_len = max(
+                intro_len_min,
+                countdown_seconds,
+                hb_voice_delay_seconds + hb_voice_dur
+            )
+        else:
+            intro_len = 0.0
 
         # Trim config (optional)
         trim_cfg = audio_cfg.get("trim_silence", {}) or {}
@@ -806,7 +825,7 @@ def handler(event):
             )
 
         # Karaoke ASS shift:
-        # - intro adds intro_len delay
+        # - intro adds intro_len delay (dynamic)
         # - trimming removes lead_trim delay
         effective_ass_shift = ((intro_len - lead_trim) if intro_enabled else (-lead_trim)) + subtitle_nudge
 
@@ -984,11 +1003,16 @@ def handler(event):
             cd_vol = float(intro_cfg.get("countdown_volume", 1.0))
             hb_vol = float(intro_cfg.get("hb_voice_volume", 1.0))
 
-            fc.append(f"[2:a]volume={intro_bgm_vol},atrim=0:{intro_len},asetpts=PTS-STARTPTS[introb]")
-            fc.append(f"[3:a]volume={cd_vol},atrim=0:2.0,asetpts=PTS-STARTPTS[countvo]")
-            fc.append(f"[4:a]volume={hb_vol},atrim=0:3.0,asetpts=PTS-STARTPTS,adelay=2000|2000[hbvo]")
+            # ✅ intro length is dynamic: intro_len
+            fc.append(f"[2:a]volume={intro_bgm_vol},atrim=0:{intro_len:.3f},asetpts=PTS-STARTPTS[introb]")
+            fc.append(f"[3:a]volume={cd_vol},atrim=0:{countdown_seconds:.3f},asetpts=PTS-STARTPTS[countvo]")
+
+            # ✅ use full hb voice duration, delayed by hb_voice_delay_seconds
+            delay_ms = int(round(hb_voice_delay_seconds * 1000))
+            fc.append(f"[4:a]volume={hb_vol},atrim=0:{hb_voice_dur:.3f},asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms}[hbvo]")
+
             fc.append("[introb][countvo][hbvo]amix=inputs=3:normalize=0:duration=longest[intromix]")
-            fc.append(f"[intromix]atrim=0:{intro_len},asetpts=PTS-STARTPTS[intro]")
+            fc.append(f"[intromix]atrim=0:{intro_len:.3f},asetpts=PTS-STARTPTS[intro]")
 
             fc.append(build_song_chain("[1:a]", "[song]"))
             fc.append("[intro][song]concat=n=2:v=0:a=1[aout]")
@@ -1075,7 +1099,11 @@ def handler(event):
             "thumbnail_ffmpeg_cmd": thumb_cmd,
             "fontsdir_used": fontsdir,
             "intro_enabled": intro_enabled,
-            "intro_seconds": intro_len if intro_enabled else 0.0,
+            "intro_seconds_min": intro_len_min if intro_enabled else 0.0,
+            "intro_seconds_effective": intro_len if intro_enabled else 0.0,
+            "hb_voice_seconds": hb_voice_dur if intro_enabled else 0.0,
+            "hb_voice_delay_seconds": hb_voice_delay_seconds if intro_enabled else 0.0,
+            "countdown_seconds": countdown_seconds if intro_enabled else 0.0,
             "normal_text_start_seconds": normal_text_start,
             "trim_enabled": trim_enabled,
             "trimmed_leading_seconds": lead_trim,
