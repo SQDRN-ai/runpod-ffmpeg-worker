@@ -87,12 +87,6 @@ def unzip_to_dir(zip_path: str, out_dir: str):
 
 
 def find_fontsdir(root_dir: str) -> str:
-    """
-    Returns a directory that contains .ttf/.otf files.
-    Handles common zip layouts like:
-      - /tmp/fonts/*.ttf
-      - /tmp/fonts/Fonts/*.ttf
-    """
     try:
         for name in os.listdir(root_dir):
             low = name.lower()
@@ -231,10 +225,6 @@ def get_media_duration_seconds(path: str) -> float:
 
 
 def shift_ass_dialogue_times(in_path: str, out_path: str, offset_s: float):
-    """
-    Shifts Dialogue start/end times by +offset_s seconds.
-    Only touches lines starting with 'Dialogue:'.
-    """
     with open(in_path, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
@@ -517,23 +507,67 @@ def _make_timed_static_overlay_ass(cfg: dict, play_w: int, play_h: int, start_s:
     return header + styles + events_header + dialogue
 
 
-def _make_countdown_overlay_ass(play_w: int, play_h: int) -> str:
+# ✅ NEW: Countdown ASS is now configurable from JSON
+def _make_countdown_overlay_ass(cfg: dict, play_w: int, play_h: int) -> str:
+    """
+    Countdown text:
+      3 at 0.0s
+      2 at 0.6s
+      1 at 1.2s
+    Default timings can be overridden via cfg.timing.
+    Style can be overridden via cfg.* similar to other overlays.
+    """
+    cfg = cfg or {}
+
+    # Style (match your other overlay config style)
+    font = str(cfg.get("font", "Boogaloo"))
+    size = int(cfg.get("size", 900))
+    color = str(cfg.get("color", "&H00FFFFFF&"))
+    outline = float(cfg.get("outline", 18))
+    outline_color = str(cfg.get("outline_color", "&H00000000&"))
+    shadow = float(cfg.get("shadow", 6))
+    back_color = str(cfg.get("back_color", "&H00000000&"))
+    spacing = float(cfg.get("spacing", 0))
+    alignment = int(cfg.get("alignment", 5))
+
+    # Position
+    x = int(cfg.get("x", play_w // 2))
+    y = int(cfg.get("y", play_h // 2))
+
+    # Fade
+    fade_in_ms = int(cfg.get("fade_in_ms", 60))
+    fade_out_ms = int(cfg.get("fade_out_ms", 120))
+
+    # Timing
+    timing = cfg.get("timing", {}) or {}
+    # default: 0.6s per number, first at 0.0
+    start0 = float(timing.get("start_seconds", 0.0))
+    step = float(timing.get("step_seconds", 0.6))
+    dur = float(timing.get("duration_seconds", 0.6))
+    # allow custom labels
+    labels = timing.get("labels", ["3", "2", "1"])
+    try:
+        labels = [str(x) for x in labels]
+    except Exception:
+        labels = ["3", "2", "1"]
+
     header = _ensure_ass_header(play_w, play_h)
+
     styles = _make_style_line(
         name="COUNT",
-        font="Boogaloo",
-        size=900,
-        primary="&H00FFFFFF&",
-        secondary="&H00FFFFFF&",
-        outline_col="&H00000000&",
-        back_col="&H00000000&",
-        spacing=0,
-        outline=18,
-        shadow=6,
-        alignment=5,
-        margin_l=0,
-        margin_r=0,
-        margin_v=0,
+        font=font,
+        size=size,
+        primary=color,
+        secondary=color,
+        outline_col=outline_color,
+        back_col=back_color,
+        spacing=spacing,
+        outline=outline,
+        shadow=shadow,
+        alignment=alignment,
+        margin_l=int(cfg.get("margin_l", 0)),
+        margin_r=int(cfg.get("margin_r", 0)),
+        margin_v=int(cfg.get("margin_v", 0)),
     ) + "\n"
 
     events_header = (
@@ -541,17 +575,21 @@ def _make_countdown_overlay_ass(play_w: int, play_h: int) -> str:
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
-    def dlg(layer, s0, s1, txt):
+    def dlg(layer: int, s0: float, s1: float, txt: str) -> str:
         st = seconds_to_ass_time(s0)
         et = seconds_to_ass_time(s1)
-        tags = f"{{\\an5\\pos({play_w//2},{play_h//2})\\fad(60,120)}}"
+        tags = f"{{\\an{alignment}\\pos({x},{y})\\fad({fade_in_ms},{fade_out_ms})}}"
         return f"Dialogue: {layer},{st},{et},COUNT,,0000,0000,0000,,{tags}{txt}\n"
 
-    return header + styles + events_header + (
-        dlg(50, 0.0, 0.6, "3") +
-        dlg(50, 0.6, 1.2, "2") +
-        dlg(50, 1.2, 1.8, "1")
-    )
+    layer = int(cfg.get("layer", 50))
+
+    dialogues = []
+    for i, lab in enumerate(labels[:3]):  # keep it 3 items unless you extend later
+        s0 = start0 + i * step
+        s1 = s0 + dur
+        dialogues.append(dlg(layer, s0, s1, lab))
+
+    return header + styles + events_header + "".join(dialogues)
 
 
 def _get_canvas(render: dict):
@@ -684,22 +722,19 @@ def handler(event):
         name_cfg = render.get("name_overlay", None)
         hb_cfg = render.get("happy_birthday_overlay", None)
 
-        # ✅ AFTER (post-song) overlay (keep your current text/settings here)
         after_cfg = render.get("after_subtitles_overlay", None)
-
-        # ✅ NEW: BEFORE (pre-song) overlay (different text, starts at 2s)
         before_cfg = render.get("before_subtitles_overlay", None)
+
+        # ✅ NEW: countdown text style config
+        countdown_cfg = render.get("countdown_overlay", {}) or {}
 
         thumb_cfg = render.get("thumbnail", None)
         timing_cfg = render.get("timing", {}) or {}
         fonts_cfg = render.get("fonts", {}) or {}
 
-        # ✅ Intro config
         intro_cfg = render.get("intro", {}) or {}
         intro_enabled = bool(intro_cfg.get("enabled", False))
         intro_len = float(intro_cfg.get("length_seconds", 5.0))
-
-        # ✅ When should "normal text" appear? After countdown (default 2.0s)
         normal_text_start = float(intro_cfg.get("normal_text_start_seconds", 2.0))
 
         play_w, play_h = _get_canvas(render)
@@ -731,9 +766,7 @@ def handler(event):
                 "canvas": {"width": play_w, "height": play_h},
             }
 
-        # -----------------------------
         # RENDER MODE
-        # -----------------------------
         video_key = inp.get("video_key")
         ass_key = inp.get("ass_key")
         music_key = inp.get("music_key")
@@ -784,26 +817,22 @@ def handler(event):
         pad = float(render.get("end_pad_seconds", 0.3))
         duration_cap = max(ass_end, audio_end) + pad if (ass_end > 0 or audio_end > 0) else None
 
-        # Shift karaoke ASS by +intro_len (because the song audio starts after the 5s intro)
+        # Shift karaoke ASS by +intro_len
         ass_path_for_render = TMP_ASS
         if intro_enabled and intro_len > 0:
             shift_ass_dialogue_times(TMP_ASS, TMP_SHIFTED_ASS, intro_len)
             ass_path_for_render = TMP_SHIFTED_ASS
 
-            # shift derived timings for "song start/end" windows
             ass_end += intro_len
             ass_start += intro_len
             if duration_cap is not None:
                 duration_cap += intro_len
 
-        # -----------------------------
-        # VIDEO filters (will be used inside filter_complex)
-        # -----------------------------
+        # VIDEO filters (used inside filter_complex)
         vf_filters = []
         if v_scale:
             vf_filters.append(f"scale={v_scale}")
 
-        # Karaoke subtitles
         subs_filter = f"subtitles={ass_path_for_render}"
         if fontsdir:
             subs_filter += f":fontsdir={fontsdir}"
@@ -815,9 +844,9 @@ def handler(event):
 
         vf_filters.append(subs_filter)
 
-        # Countdown numbers during intro
+        # ✅ Countdown numbers during intro (style from JSON)
         if intro_enabled:
-            countdown_ass = _make_countdown_overlay_ass(play_w, play_h)
+            countdown_ass = _make_countdown_overlay_ass(countdown_cfg, play_w, play_h)
             with open(TMP_COUNTDOWN_ASS, "w", encoding="utf-8") as f:
                 f.write(countdown_ass)
 
@@ -826,8 +855,7 @@ def handler(event):
                 cd_filter += f":fontsdir={fontsdir}"
             vf_filters.append(cd_filter)
 
-        # ✅ HAPPY BIRTHDAY overlay + Name overlay should appear after countdown (default 2s),
-        # not after 5 seconds. So shift these overlays by normal_text_start.
+        # HAPPY BIRTHDAY overlay (shift to normal_text_start)
         happy_birthday_used = False
         if hb_cfg is True:
             hb_cfg = {}
@@ -869,6 +897,7 @@ def handler(event):
                 vf_filters.append(hb_filter)
                 happy_birthday_used = True
 
+        # Name overlay (shift to normal_text_start)
         name_overlay_used = False
         if isinstance(name_cfg, dict) and str(name_cfg.get("text", "")).strip():
             name_ass = _make_name_overlay_ass(name_cfg, play_w, play_h)
@@ -884,31 +913,21 @@ def handler(event):
             vf_filters.append(name_filter)
             name_overlay_used = True
 
-        # ✅ BEFORE (pre-song) overlay: start at 2s, end at ass_start (same end timing as before)
+        # BEFORE overlay (pre-song) using before_cfg: start at normal_text_start, end at ass_start
         before_subtitles_used = False
         before_subtitles_window = None
-
-        # Keep old behavior if you didn't add before_subtitles_overlay: fall back to after_cfg text
-        effective_before_cfg = None
         if before_cfg is True:
             before_cfg = {}
-        if isinstance(before_cfg, dict):
-            effective_before_cfg = dict(before_cfg)
-            effective_before_cfg.setdefault("enabled", True)
-        elif isinstance(after_cfg, dict) and after_cfg is not None:
-            # fallback: use the old config (but you asked to make it adjustable, so prefer before_cfg)
-            effective_before_cfg = None
-
-        if isinstance(effective_before_cfg, dict) and duration_cap is not None:
-            enabled = bool(effective_before_cfg.get("enabled", True))
-            min_seconds = float(effective_before_cfg.get("min_seconds", 0.1))
+        if isinstance(before_cfg, dict) and duration_cap is not None:
+            enabled = bool(before_cfg.get("enabled", True))
+            min_seconds = float(before_cfg.get("min_seconds", 0.1))
 
             if enabled:
                 start_before = max(0.0, float(normal_text_start))
-                end_before = max(start_before, float(ass_start))  # end when song/lyrics begin
+                end_before = max(start_before, float(ass_start))
 
                 if (end_before - start_before) >= min_seconds:
-                    before_ass = _make_timed_static_overlay_ass(effective_before_cfg, play_w, play_h, start_before, end_before)
+                    before_ass = _make_timed_static_overlay_ass(before_cfg, play_w, play_h, start_before, end_before)
                     with open(TMP_BEFORE_ASS, "w", encoding="utf-8") as f:
                         f.write(before_ass)
 
@@ -920,10 +939,9 @@ def handler(event):
                     before_subtitles_used = True
                     before_subtitles_window = {"start": start_before, "end": end_before, "min_seconds": min_seconds}
 
-        # ✅ AFTER (post-song) overlay: keep EXACT current behavior + current text
+        # AFTER overlay (post-song) keep as-is
         after_subtitles_used = False
         after_subtitles_window = None
-
         if after_cfg is True:
             after_cfg = {}
         if isinstance(after_cfg, dict) and duration_cap is not None:
@@ -949,9 +967,7 @@ def handler(event):
 
         vf = ",".join(vf_filters)
 
-        # -----------------------------
         # FILTER_COMPLEX (video + audio)
-        # -----------------------------
         filter_complex_parts = []
         filter_complex_parts.append(f"[0:v]{vf}[vout]")
 
@@ -993,18 +1009,14 @@ def handler(event):
 
         filter_complex = ";".join(filter_complex_parts)
 
-        # -----------------------------
         # ffmpeg command
-        # -----------------------------
         cmd = ["ffmpeg", "-y"]
 
-        # Video input (looping starts immediately)
         if loop_video:
             cmd += ["-stream_loop", "-1", "-i", TMP_IN]
         else:
             cmd += ["-i", TMP_IN]
 
-        # Audio inputs
         cmd += ["-i", TMP_MUSIC]
         if intro_enabled:
             cmd += ["-i", TMP_INTRO_BGM, "-i", TMP_COUNTDOWN_VO, "-i", TMP_HB_VO]
@@ -1075,10 +1087,10 @@ def handler(event):
             "intro_enabled": intro_enabled,
             "intro_seconds": intro_len if intro_enabled else 0.0,
             "normal_text_start_seconds": normal_text_start,
-            "happy_birthday_used": happy_birthday_used,
-            "name_overlay_used": name_overlay_used,
-            "before_subtitles_used": before_subtitles_used,
-            "after_subtitles_used": after_subtitles_used,
+            "happy_birthday_used": bool(happy_birthday_used),
+            "name_overlay_used": bool(name_overlay_used),
+            "before_subtitles_used": bool(before_subtitles_used),
+            "after_subtitles_used": bool(after_subtitles_used),
             "before_subtitles_window": before_subtitles_window,
             "after_subtitles_window": after_subtitles_window,
             "ffmpeg_cmd": cmd,
