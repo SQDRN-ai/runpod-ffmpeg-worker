@@ -717,9 +717,13 @@ def handler(event):
         intro_len_min = float(intro_cfg.get("length_seconds", 5.0))  # minimum intro
         normal_text_start = float(intro_cfg.get("normal_text_start_seconds", 2.0))
 
-        # New optional knobs (default keeps your current behavior)
+        # Current intro behavior
         countdown_seconds = float(intro_cfg.get("countdown_seconds", 2.0))
         hb_voice_delay_seconds = float(intro_cfg.get("hb_voice_delay_seconds", 2.0))
+
+        # NEW: re-use same HB voice at end of song
+        add_hb_voice_to_song_end = bool(intro_cfg.get("add_hb_voice_to_song_end", True))
+        song_end_hb_voice_delay_seconds = float(intro_cfg.get("song_end_hb_voice_delay_seconds", 0.0))
 
         play_w, play_h = _get_canvas(render)
 
@@ -782,8 +786,9 @@ def handler(event):
         download_from_r2(ass_key, TMP_ASS)
         download_from_r2(music_key, TMP_MUSIC)
 
-        hb_voice_dur = 3.0  # fallback
+        hb_voice_dur = 0.0
         intro_len = 0.0
+        hb_voice_available = False
 
         # Intro assets (and compute dynamic intro length)
         if intro_enabled:
@@ -796,8 +801,9 @@ def handler(event):
             download_from_r2(intro_cfg["hb_voice_key"], TMP_HB_VO)
 
             hb_voice_dur = max(0.0, get_media_duration_seconds(TMP_HB_VO))
+            hb_voice_available = hb_voice_dur > 0.0
 
-            # ✅ Dynamic intro length: minimum vs spoken audio length
+            # Dynamic intro length: minimum vs spoken audio length
             intro_len = max(
                 intro_len_min,
                 countdown_seconds,
@@ -805,6 +811,11 @@ def handler(event):
             )
         else:
             intro_len = 0.0
+
+        # End HB voice rules
+        end_hb_voice_enabled = bool(intro_enabled and hb_voice_available and add_hb_voice_to_song_end)
+        hb_vol_intro = float(intro_cfg.get("hb_voice_volume", 1.0))
+        hb_vol_song_end = float(intro_cfg.get("song_end_hb_voice_volume", hb_vol_intro))
 
         # Trim config (optional)
         trim_cfg = audio_cfg.get("trim_silence", {}) or {}
@@ -825,7 +836,7 @@ def handler(event):
             )
 
         # Karaoke ASS shift:
-        # - intro adds intro_len delay (dynamic)
+        # - intro adds intro_len delay
         # - trimming removes lead_trim delay
         effective_ass_shift = ((intro_len - lead_trim) if intro_enabled else (-lead_trim)) + subtitle_nudge
 
@@ -835,13 +846,26 @@ def handler(event):
             ass_path_for_render = TMP_SHIFTED_ASS
 
         # Timings based on final ASS
+        # ass_end = absolute "last sung word ended" in the final output timeline
         ass_end = get_ass_end_seconds(ass_path_for_render)
         ass_start = get_ass_start_seconds(ass_path_for_render)
 
         music_dur = get_media_duration_seconds(TMP_MUSIC)
         effective_song_dur = max(0.0, music_dur - lead_trim)
+
+        # Base audio ends here, before any added end HB voice
+        base_audio_end_est = (intro_len if intro_enabled else 0.0) + effective_song_dur
+
+        # NEW: end HB voice starts exactly when singing ends (ASS last end),
+        # optionally plus a tiny user-defined delay.
+        song_end_hb_start = max(0.0, ass_end + song_end_hb_voice_delay_seconds) if end_hb_voice_enabled else None
+        song_end_hb_end = (song_end_hb_start + hb_voice_dur) if (end_hb_voice_enabled and song_end_hb_start is not None) else None
+
         pad = float(render.get("end_pad_seconds", 0.3))
-        total_audio_len_est = (intro_len if intro_enabled else 0.0) + effective_song_dur
+        total_audio_len_est = max(
+            base_audio_end_est,
+            (song_end_hb_end or 0.0)
+        )
         duration_cap = max(ass_end, total_audio_len_est) + pad if (ass_end > 0 or total_audio_len_est > 0) else None
 
         # -----------------------------
@@ -997,25 +1021,63 @@ def handler(event):
             return f"{in_label}{','.join(parts)}{out_label}"
 
         if not intro_enabled:
-            fc.append(build_song_chain("[1:a]", "[aout]"))
+            # No intro, just song
+            fc.append(build_song_chain("[1:a]", "[basea]"))
+            current_audio_label = "[basea]"
         else:
             intro_bgm_vol = float(intro_cfg.get("bgm_volume", 1.0))
             cd_vol = float(intro_cfg.get("countdown_volume", 1.0))
-            hb_vol = float(intro_cfg.get("hb_voice_volume", 1.0))
 
-            # ✅ intro length is dynamic: intro_len
+            if end_hb_voice_enabled:
+                fc.append("[4:a]asplit=2[hbvo_src_intro][hbvo_src_end]")
+                hb_intro_src = "[hbvo_src_intro]"
+                hb_end_src = "[hbvo_src_end]"
+            else:
+                hb_intro_src = "[4:a]"
+                hb_end_src = None
+
+            # Intro components
             fc.append(f"[2:a]volume={intro_bgm_vol},atrim=0:{intro_len:.3f},asetpts=PTS-STARTPTS[introb]")
             fc.append(f"[3:a]volume={cd_vol},atrim=0:{countdown_seconds:.3f},asetpts=PTS-STARTPTS[countvo]")
 
-            # ✅ use full hb voice duration, delayed by hb_voice_delay_seconds
             delay_ms = int(round(hb_voice_delay_seconds * 1000))
-            fc.append(f"[4:a]volume={hb_vol},atrim=0:{hb_voice_dur:.3f},asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms}[hbvo]")
+            fc.append(
+                f"{hb_intro_src}volume={hb_vol_intro},atrim=0:{hb_voice_dur:.3f},"
+                f"asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms}[hbvo_intro]"
+            )
 
-            fc.append("[introb][countvo][hbvo]amix=inputs=3:normalize=0:duration=longest[intromix]")
+            fc.append("[introb][countvo][hbvo_intro]amix=inputs=3:normalize=0:duration=longest[intromix]")
             fc.append(f"[intromix]atrim=0:{intro_len:.3f},asetpts=PTS-STARTPTS[intro]")
 
+            # Song
             fc.append(build_song_chain("[1:a]", "[song]"))
-            fc.append("[intro][song]concat=n=2:v=0:a=1[aout]")
+
+            # Base audio = intro + song
+            fc.append("[intro][song]concat=n=2:v=0:a=1[basea]")
+            current_audio_label = "[basea]"
+
+        # NEW: add same HB voice at song end
+        # Starts exactly at the last sung word end time (ass_end), even if music continues or not.
+        song_end_hb_added = False
+        if end_hb_voice_enabled and song_end_hb_start is not None and hb_voice_dur > 0.0:
+            end_delay_ms = int(round(song_end_hb_start * 1000))
+
+            if intro_enabled and hb_end_src is not None:
+                fc.append(
+                    f"{hb_end_src}volume={hb_vol_song_end},atrim=0:{hb_voice_dur:.3f},"
+                    f"asetpts=PTS-STARTPTS,adelay={end_delay_ms}|{end_delay_ms}[hbvo_end]"
+                )
+            else:
+                # Fallback path; should normally not happen because end_hb_voice_enabled requires intro_enabled
+                fc.append(
+                    f"[4:a]volume={hb_vol_song_end},atrim=0:{hb_voice_dur:.3f},"
+                    f"asetpts=PTS-STARTPTS,adelay={end_delay_ms}|{end_delay_ms}[hbvo_end]"
+                )
+
+            fc.append(f"{current_audio_label}[hbvo_end]amix=inputs=2:normalize=0:duration=longest[aout]")
+            song_end_hb_added = True
+        else:
+            fc.append(f"{current_audio_label}anull[aout]")
 
         filter_complex = ";".join(fc)
 
@@ -1068,6 +1130,7 @@ def handler(event):
                 "stderr": p.stderr[-20000:],
                 "stdout": p.stdout[-20000:],
                 "cmd": cmd,
+                "filter_complex": filter_complex,
             }
 
         uploaded = upload_to_r2(TMP_OUT, out_key)
@@ -1115,8 +1178,14 @@ def handler(event):
             "after_subtitles_used": after_subtitles_used,
             "before_subtitles_window": before_subtitles_window,
             "after_subtitles_window": after_subtitles_window,
+            "song_end_hb_voice_enabled": end_hb_voice_enabled,
+            "song_end_hb_voice_added": song_end_hb_added,
+            "song_end_hb_voice_start_seconds": song_end_hb_start,
+            "song_end_hb_voice_end_seconds": song_end_hb_end,
+            "base_audio_end_est_seconds": base_audio_end_est,
             "duration_cap_seconds": duration_cap,
             "ffmpeg_cmd": cmd,
+            "filter_complex": filter_complex,
             "ffmpeg_stderr_tail": p.stderr[-20000:],
         }
 
