@@ -1220,48 +1220,48 @@ def handler(event):
                 }
                 continue
 
-                audio_windows = [
-                        (2.0, 8.0),
-                        (16.0, 22.0),
-                        (26.0, 32.0),
-                    ]
+            audio_windows = [
+                (2.0, 8.0),
+                (16.0, 22.0),
+                (26.0, 32.0),
+            ]
 
-                    audio_ok = True
-                    audio_checks = []
+            audio_ok = True
+            audio_checks = []
 
-                    for start_offset, end_offset in audio_windows:
-                        start_s = (intro_len + start_offset) if intro_enabled else start_offset
-                        duration = end_offset - start_offset
+            for start_offset, end_offset in audio_windows:
+                start_s = (intro_len + start_offset) if intro_enabled else start_offset
+                duration = end_offset - start_offset
 
-                        ok, audio_check = validate_output_audio_after_intro(
-                            TMP_OUT,
-                            start_s=start_s,
-                            check_duration_s=duration,
-                            silence_threshold_db=float(audio_cfg.get("post_audio_silence_threshold_db", -55.0)),
-                        )
+                ok, audio_check = validate_output_audio_after_intro(
+                    TMP_OUT,
+                    start_s=start_s,
+                    check_duration_s=duration,
+                    silence_threshold_db=float(audio_cfg.get("post_audio_silence_threshold_db", -55.0)),
+                )
 
-                        audio_checks.append({
-                            "window_relative_to_song": [start_offset, end_offset],
-                            "checked_from_seconds": start_s,
-                            "checked_duration_seconds": duration,
-                            "ok": ok,
-                            "result": audio_check,
-                        })
+                audio_checks.append({
+                    "window_relative_to_song": [start_offset, end_offset],
+                    "checked_from_seconds": start_s,
+                    "checked_duration_seconds": duration,
+                    "ok": ok,
+                    "result": audio_check,
+                })
 
-                        if not ok:
-                            audio_ok = False
+                if not ok:
+                    audio_ok = False
 
-                    last_audio_check = {
-                        "all_windows_ok": audio_ok,
-                        "windows": audio_checks,
-                    }
+            last_audio_check = {
+                "all_windows_ok": audio_ok,
+                "windows": audio_checks,
+            }
 
             if audio_ok:
                 break
 
             last_render_error = {
                 "error": "output audio validation failed",
-                "audio_check": audio_check,
+                "audio_check": last_audio_check,
                 "cmd": cmd,
                 "filter_complex": filter_complex,
                 "ffmpeg_stderr_tail": p.stderr[-20000:],
