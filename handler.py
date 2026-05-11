@@ -228,6 +228,85 @@ def get_media_duration_seconds(path: str) -> float:
         return 0.0
 
 
+def validate_output_audio_after_intro(
+    path: str,
+    start_s: float,
+    check_duration_s: float = 8.0,
+    silence_threshold_db: float = -55.0,
+):
+    """
+    Controleert of de MP4 output daadwerkelijk audio bevat én of er hoorbare audio zit
+    in het stuk ná de intro, waar de muziek/song aanwezig moet zijn.
+
+    Returns:
+      (True, details)  als audio ok is
+      (False, details) als audio ontbreekt of te stil is
+    """
+
+    # 1) Check: bestaat er überhaupt een audiostream?
+    p = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_type,duration",
+            "-of", "default=nw=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if p.returncode != 0 or "codec_type=audio" not in p.stdout:
+        return False, {
+            "reason": "no_audio_stream",
+            "ffprobe_stdout": p.stdout,
+            "ffprobe_stderr": p.stderr,
+        }
+
+    # 2) Check: meet volume in het segment ná de intro
+    start_s = max(0.0, float(start_s))
+    p = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-nostats",
+            "-ss", f"{start_s:.3f}",
+            "-t", f"{float(check_duration_s):.3f}",
+            "-i", path,
+            "-map", "0:a:0",
+            "-af", "volumedetect",
+            "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    log = (p.stderr or "") + "\n" + (p.stdout or "")
+
+    m = re.search(r"max_volume:\s*(-?[0-9.]+)\s*dB", log)
+    if not m:
+        return False, {
+            "reason": "could_not_measure_audio_volume",
+            "ffmpeg_log_tail": log[-4000:],
+        }
+
+    max_volume = float(m.group(1))
+
+    if max_volume < float(silence_threshold_db):
+        return False, {
+            "reason": "audio_after_intro_too_quiet_or_silent",
+            "max_volume_db": max_volume,
+            "threshold_db": float(silence_threshold_db),
+            "checked_from_seconds": start_s,
+            "checked_duration_seconds": float(check_duration_s),
+            "ffmpeg_log_tail": log[-4000:],
+        }
+
+    return True, {
+        "max_volume_db": max_volume,
+        "checked_from_seconds": start_s,
+        "checked_duration_seconds": float(check_duration_s),
+    }
+
+
 def shift_ass_dialogue_times(in_path: str, out_path: str, offset_s: float):
     """
     Shifts Dialogue start/end times by +offset_s seconds.
@@ -1122,15 +1201,77 @@ def handler(event):
 
         cmd.append(TMP_OUT)
 
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        if p.returncode != 0:
-            return {
-                "error": "ffmpeg failed",
-                "returncode": p.returncode,
-                "stderr": p.stderr[-20000:],
-                "stdout": p.stdout[-20000:],
+        last_render_error = None
+        last_audio_check = None
+        p = None
+
+        for render_attempt in range(2):
+            p = subprocess.run(cmd, capture_output=True, text=True)
+
+            if p.returncode != 0:
+                last_render_error = {
+                    "error": "ffmpeg failed",
+                    "returncode": p.returncode,
+                    "stderr": p.stderr[-20000:],
+                    "stdout": p.stdout[-20000:],
+                    "cmd": cmd,
+                    "filter_complex": filter_complex,
+                    "render_attempt": render_attempt + 1,
+                }
+                continue
+
+                audio_windows = [
+                        (2.0, 8.0),
+                        (16.0, 22.0),
+                        (26.0, 32.0),
+                    ]
+
+                    audio_ok = True
+                    audio_checks = []
+
+                    for start_offset, end_offset in audio_windows:
+                        start_s = (intro_len + start_offset) if intro_enabled else start_offset
+                        duration = end_offset - start_offset
+
+                        ok, audio_check = validate_output_audio_after_intro(
+                            TMP_OUT,
+                            start_s=start_s,
+                            check_duration_s=duration,
+                            silence_threshold_db=float(audio_cfg.get("post_audio_silence_threshold_db", -55.0)),
+                        )
+
+                        audio_checks.append({
+                            "window_relative_to_song": [start_offset, end_offset],
+                            "checked_from_seconds": start_s,
+                            "checked_duration_seconds": duration,
+                            "ok": ok,
+                            "result": audio_check,
+                        })
+
+                        if not ok:
+                            audio_ok = False
+
+                    last_audio_check = {
+                        "all_windows_ok": audio_ok,
+                        "windows": audio_checks,
+                    }
+
+            if audio_ok:
+                break
+
+            last_render_error = {
+                "error": "output audio validation failed",
+                "audio_check": audio_check,
                 "cmd": cmd,
                 "filter_complex": filter_complex,
+                "ffmpeg_stderr_tail": p.stderr[-20000:],
+                "render_attempt": render_attempt + 1,
+            }
+        else:
+            return {
+                **(last_render_error or {"error": "render failed"}),
+                "retried": True,
+                "max_attempts": 2,
             }
 
         uploaded = upload_to_r2(TMP_OUT, out_key)
@@ -1184,6 +1325,9 @@ def handler(event):
             "song_end_hb_voice_end_seconds": song_end_hb_end,
             "base_audio_end_est_seconds": base_audio_end_est,
             "duration_cap_seconds": duration_cap,
+            "audio_validation": last_audio_check,
+            "render_attempts_used": render_attempt + 1,
+            "audio_validation_retried": render_attempt > 0,
             "ffmpeg_cmd": cmd,
             "filter_complex": filter_complex,
             "ffmpeg_stderr_tail": p.stderr[-20000:],
