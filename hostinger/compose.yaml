@@ -1,0 +1,100 @@
+name: birthday-workers
+
+x-common: &common
+  env_file: .env
+  restart: unless-stopped
+  networks:
+    - private
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    networks:
+      - private
+
+  render-api:
+    <<: *common
+    build:
+      context: .
+      target: render
+    environment:
+      WORKER_KIND: render
+      REDIS_URL: redis://redis:6379/0
+    networks:
+      private: {}
+      n8n-shared:
+        aliases: [birthday-render-api]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  render-worker:
+    <<: *common
+    build:
+      context: .
+      target: render
+    command: ["python", "-m", "app.entrypoint", "worker"]
+    environment:
+      WORKER_KIND: render
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - render-tmp:/tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "${RENDER_CPU_LIMIT:-6}"
+
+  voice-api:
+    <<: *common
+    build:
+      context: .
+      target: voice
+    environment:
+      WORKER_KIND: voice
+      REDIS_URL: redis://redis:6379/0
+    networks:
+      private: {}
+      n8n-shared:
+        aliases: [birthday-voice-api]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  voice-worker:
+    <<: *common
+    build:
+      context: .
+      target: voice
+    command: ["python", "-m", "app.entrypoint", "worker"]
+    environment:
+      WORKER_KIND: voice
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - voice-tmp:/tmp
+      - voice-model-cache:/models
+    deploy:
+      resources:
+        limits:
+          cpus: "${VOICE_CPU_LIMIT:-2}"
+
+networks:
+  private:
+    internal: true
+  n8n-shared:
+    external: true
+    name: ${N8N_DOCKER_NETWORK}
+
+volumes:
+  redis-data:
+  render-tmp:
+  voice-tmp:
+  voice-model-cache:
+
