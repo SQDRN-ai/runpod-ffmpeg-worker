@@ -32,7 +32,10 @@ services:
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
-    cap_add: [SETUID, SETGID]
+    # The official Redis entrypoint starts as root, repairs /data ownership, and
+    # then drops to the redis user. These are the minimal capabilities it needs
+    # to traverse an existing AOF directory after a host reboot.
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETUID, SETGID]
     security_opt: ["no-new-privileges:true"]
     volumes:
       - redis-data:/data
