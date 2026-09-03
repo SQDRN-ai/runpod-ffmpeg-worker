@@ -40,6 +40,12 @@ services:
     volumes:
       - redis-data:/data
     networks: [private]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     deploy:
       resources:
         limits:
@@ -48,6 +54,9 @@ services:
 
   render-api:
     <<: *api-security
+    depends_on:
+      redis:
+        condition: service_healthy
     build:
       context: .
       target: render
@@ -72,6 +81,9 @@ services:
 
   render-worker:
     <<: *worker-security
+    depends_on:
+      redis:
+        condition: service_healthy
     build:
       context: .
       target: render
@@ -90,6 +102,9 @@ services:
 
   voice-api:
     <<: *api-security
+    depends_on:
+      redis:
+        condition: service_healthy
     build:
       context: .
       target: voice
@@ -114,6 +129,9 @@ services:
 
   voice-worker:
     <<: *worker-security
+    depends_on:
+      redis:
+        condition: service_healthy
     build:
       context: .
       target: voice
