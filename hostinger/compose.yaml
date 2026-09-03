@@ -102,6 +102,57 @@ services:
           cpus: "${RENDER_CPU_LIMIT:-2.5}"
           memory: ${RENDER_MEMORY_LIMIT:-3G}
 
+  theme-api:
+    <<: *api-security
+    depends_on:
+      redis:
+        condition: service_healthy
+    build:
+      context: ..
+      dockerfile: hostinger/Dockerfile
+      target: render
+    environment:
+      WORKER_KIND: theme
+      REDIS_URL: redis://redis:6379/0
+      WORKER_API_TOKEN: ${WORKER_API_TOKEN:?WORKER_API_TOKEN is required}
+    networks:
+      private: {}
+      n8n-shared:
+        aliases: [birthday-theme-render-api]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 256M
+
+  theme-worker:
+    <<: *worker-security
+    depends_on:
+      redis:
+        condition: service_healthy
+    build:
+      context: ..
+      dockerfile: hostinger/Dockerfile
+      target: render
+    command: ["python", "-m", "app.entrypoint", "worker"]
+    environment:
+      <<: *worker-environment
+      WORKER_KIND: theme
+      WORKER_POST_JOB_DELAY_SECONDS: ${THEME_POST_JOB_DELAY_SECONDS:-10}
+    networks: [private, egress]
+    volumes:
+      - theme-tmp:/tmp
+    deploy:
+      resources:
+        limits:
+          cpus: "${THEME_CPU_LIMIT:-2.5}"
+          memory: ${THEME_MEMORY_LIMIT:-3G}
+
   voice-api:
     <<: *api-security
     depends_on:
@@ -164,5 +215,6 @@ networks:
 volumes:
   redis-data:
   render-tmp:
+  theme-tmp:
   voice-tmp:
   voice-model-cache:

@@ -9,8 +9,8 @@ import redis
 
 def settings() -> dict:
     kind = os.environ.get("WORKER_KIND", "render").strip().lower()
-    if kind not in {"render", "voice"}:
-        raise RuntimeError("WORKER_KIND must be 'render' or 'voice'")
+    if kind not in {"render", "theme", "voice"}:
+        raise RuntimeError("WORKER_KIND must be 'render', 'theme' or 'voice'")
     return {
         "kind": kind,
         "queue": f"birthday:{kind}:queue",
@@ -19,6 +19,7 @@ def settings() -> dict:
         "ttl": int(os.environ.get("JOB_TTL_SECONDS", "604800")),
         "heavy_lock": os.environ.get("HEAVY_LOCK_KEY", "birthday:heavy:lock"),
         "heavy_lock_ttl": int(os.environ.get("HEAVY_LOCK_TTL_SECONDS", "43200")),
+        "post_job_delay": float(os.environ.get("WORKER_POST_JOB_DELAY_SECONDS", "0")),
         "worker_id": f"{socket.gethostname()}-{os.getpid()}",
     }
 

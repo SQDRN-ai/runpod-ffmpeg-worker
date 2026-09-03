@@ -10,7 +10,7 @@ from app.common import load_job, redis_client, save_job, settings
 
 
 def get_handler(kind: str):
-    module_name = "render_handler" if kind == "render" else "voice_handler"
+    module_name = "render_handler" if kind in {"render", "theme"} else "voice_handler"
     return importlib.import_module(module_name).handler
 
 
@@ -80,6 +80,10 @@ def run() -> None:
                 heavy_lock.release()
             except LockError:
                 pass
+            # Theme batches deliberately yield after every video so that the
+            # existing regular and voice queues can acquire the shared CPU lock.
+            if config["post_job_delay"] > 0:
+                time.sleep(config["post_job_delay"])
 
 
 if __name__ == "__main__":

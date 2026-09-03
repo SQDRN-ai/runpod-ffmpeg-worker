@@ -1,9 +1,10 @@
 # Birthday workers for Hostinger
 
-This independent Docker Compose stack hosts two CPU workloads currently handled
-by RunPod:
+This independent Docker Compose stack hosts CPU workloads currently handled by
+RunPod:
 
 - `render-*`: the 4K FFmpeg video and thumbnail renderer;
+- `theme-*`: an isolated queue for themed slideshow renders;
 - `voice-*`: Demucs-based vocal removal / instrumental creation.
 
 The render handler also supports a separate `render_slideshow` mode for themed
@@ -25,14 +26,16 @@ to their queue after a worker restart. Outputs continue to be read from and
 written to Cloudflare R2, while per-job temporary media is deleted after each job.
 
 No host port is published. The APIs are reachable only from n8n over its
-existing Docker network as `http://birthday-render-api:8080` and
-`http://birthday-voice-api:8080`.
+existing Docker network as `http://birthday-render-api:8080`,
+`http://birthday-theme-render-api:8080`, and `http://birthday-voice-api:8080`.
 
 ## Themed slideshow payload
 
-Submit slideshow jobs to the same render API. `audio_duration_seconds` is a
-planning hint; the worker verifies the downloaded audio with FFprobe before it
-renders.
+Submit slideshow jobs to the isolated Theme API. Its queue shares the heavy-job
+lock with the regular and voice workers, but pauses briefly after every Theme
+job so a batch cannot continuously monopolize the VPS. `audio_duration_seconds`
+is a planning hint; the worker verifies the downloaded audio with FFprobe before
+it renders.
 
 ```json
 {
@@ -94,7 +97,7 @@ cutover.
    ```sh
    docker compose up -d --build
    docker compose ps
-   docker compose logs -f render-api render-worker
+   docker compose logs -f render-api render-worker theme-api theme-worker
    ```
 
 4. From the n8n container, verify the render API before changing a workflow:
@@ -109,6 +112,8 @@ Only make these changes in a disabled workflow copy:
 
 - FFmpeg submit node: `POST http://birthday-render-api:8080/v1/jobs`;
 - FFmpeg status node: `GET http://birthday-render-api:8080/v1/jobs/{{ job id }}`;
+- Theme submit node: `POST http://birthday-theme-render-api:8080/v1/jobs`;
+- Theme status node: `GET http://birthday-theme-render-api:8080/v1/jobs/{{ job id }}`;
 - use `Authorization: Bearer <WORKER_API_TOKEN>` on both nodes;
 - retain body and status polling logic unchanged.
 
