@@ -85,7 +85,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "${RENDER_CPU_LIMIT:-1.25}"
+          cpus: "${RENDER_CPU_LIMIT:-2.5}"
           memory: ${RENDER_MEMORY_LIMIT:-3G}
 
   voice-api:
@@ -128,7 +128,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "${VOICE_CPU_LIMIT:-1.0}"
+          cpus: "${VOICE_CPU_LIMIT:-2.0}"
           memory: ${VOICE_MEMORY_LIMIT:-4G}
 
 networks:

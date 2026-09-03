@@ -15,7 +15,7 @@ Each API accepts the existing RunPod-shaped request body (`{ "input": { ... } }`
 and returns RunPod-compatible `id` and `status` fields. n8n can therefore keep
 its polling pattern. Each worker has a dedicated durable Redis queue. A shared
 lock permits only one CPU-heavy render or voice-removal job at a time, preserving
-capacity for n8n and PostgreSQL on the two-vCPU VPS. Interrupted jobs are returned
+capacity for n8n and PostgreSQL on the VPS. Interrupted jobs are returned
 to their queue after a worker restart. Outputs continue to be read from and
 written to Cloudflare R2, while per-job temporary media is deleted after each job.
 
@@ -24,8 +24,10 @@ existing Docker network as `http://birthday-render-api:8080` and
 `http://birthday-voice-api:8080`.
 
 Workers use a separate egress network for R2 and source downloads. Redis remains
-on an internal-only network. CPU and memory limits are intentionally conservative
-for a 2-vCPU / 8-GB host and must be benchmarked before production cutover.
+on an internal-only network. The default limits target a 4-vCPU / 16-GB Hostinger
+KVM4. A single heavy job can use at most 2.5 vCPU, leaving capacity for n8n,
+PostgreSQL, and the API containers. Benchmark these limits before production
+cutover.
 
 ## Deploy on the VPS
 
