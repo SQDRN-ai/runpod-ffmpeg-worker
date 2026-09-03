@@ -1,4 +1,5 @@
 import os
+import secrets
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -12,7 +13,7 @@ def require_token(authorization: str | None) -> None:
     expected = os.environ.get("WORKER_API_TOKEN", "")
     if not expected:
         raise RuntimeError("WORKER_API_TOKEN is not configured")
-    if authorization != f"Bearer {expected}":
+    if not authorization or not secrets.compare_digest(authorization, f"Bearer {expected}"):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -57,4 +58,3 @@ def get_job(job_id: str, authorization: str | None = Header(default=None)) -> di
     if "error" in job:
         response["error"] = job["error"]
     return response
-

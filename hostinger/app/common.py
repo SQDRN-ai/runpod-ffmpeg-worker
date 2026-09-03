@@ -14,8 +14,11 @@ def settings() -> dict:
     return {
         "kind": kind,
         "queue": f"birthday:{kind}:queue",
+        "processing_queue": f"birthday:{kind}:processing",
         "key_prefix": f"birthday:{kind}:job:",
         "ttl": int(os.environ.get("JOB_TTL_SECONDS", "604800")),
+        "heavy_lock": os.environ.get("HEAVY_LOCK_KEY", "birthday:heavy:lock"),
+        "heavy_lock_ttl": int(os.environ.get("HEAVY_LOCK_TTL_SECONDS", "43200")),
         "worker_id": f"{socket.gethostname()}-{os.getpid()}",
     }
 
@@ -49,4 +52,3 @@ def new_job(payload: dict) -> dict:
         "createdAt": now(),
         "updatedAt": now(),
     }
-

@@ -1,29 +1,58 @@
 name: birthday-workers
 
-x-common: &common
-  env_file: .env
+x-api-security: &api-security
   restart: unless-stopped
-  networks:
-    - private
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs:
+    - "/tmp:size=16m,mode=1777"
+  pids_limit: 128
+
+x-worker-security: &worker-security
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 256
+
+x-worker-environment: &worker-environment
+  REDIS_URL: redis://redis:6379/0
+  R2_ENDPOINT: ${R2_ENDPOINT:?R2_ENDPOINT is required}
+  R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID is required}
+  R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY is required}
+  R2_BUCKET: ${R2_BUCKET:?R2_BUCKET is required}
+  R2_PUBLIC_BASE_URL: ${R2_PUBLIC_BASE_URL:-}
+  JOB_TTL_SECONDS: ${JOB_TTL_SECONDS:-604800}
+  HEAVY_LOCK_KEY: birthday:heavy:lock
+  HEAVY_LOCK_TTL_SECONDS: ${HEAVY_LOCK_TTL_SECONDS:-43200}
 
 services:
   redis:
     image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "192mb", "--maxmemory-policy", "noeviction"]
     restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     volumes:
       - redis-data:/data
-    networks:
-      - private
+    networks: [private]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: 256M
 
   render-api:
-    <<: *common
+    <<: *api-security
     build:
       context: .
       target: render
     environment:
       WORKER_KIND: render
       REDIS_URL: redis://redis:6379/0
+      WORKER_API_TOKEN: ${WORKER_API_TOKEN:?WORKER_API_TOKEN is required}
     networks:
       private: {}
       n8n-shared:
@@ -33,31 +62,39 @@ services:
       interval: 20s
       timeout: 5s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 256M
 
   render-worker:
-    <<: *common
+    <<: *worker-security
     build:
       context: .
       target: render
     command: ["python", "-m", "app.entrypoint", "worker"]
     environment:
+      <<: *worker-environment
       WORKER_KIND: render
-      REDIS_URL: redis://redis:6379/0
+    networks: [private, egress]
     volumes:
       - render-tmp:/tmp
     deploy:
       resources:
         limits:
-          cpus: "${RENDER_CPU_LIMIT:-6}"
+          cpus: "${RENDER_CPU_LIMIT:-1.25}"
+          memory: ${RENDER_MEMORY_LIMIT:-2G}
 
   voice-api:
-    <<: *common
+    <<: *api-security
     build:
       context: .
       target: voice
     environment:
       WORKER_KIND: voice
       REDIS_URL: redis://redis:6379/0
+      WORKER_API_TOKEN: ${WORKER_API_TOKEN:?WORKER_API_TOKEN is required}
     networks:
       private: {}
       n8n-shared:
@@ -67,34 +104,41 @@ services:
       interval: 20s
       timeout: 5s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 256M
 
   voice-worker:
-    <<: *common
+    <<: *worker-security
     build:
       context: .
       target: voice
     command: ["python", "-m", "app.entrypoint", "worker"]
     environment:
+      <<: *worker-environment
       WORKER_KIND: voice
-      REDIS_URL: redis://redis:6379/0
+    networks: [private, egress]
     volumes:
       - voice-tmp:/tmp
       - voice-model-cache:/models
     deploy:
       resources:
         limits:
-          cpus: "${VOICE_CPU_LIMIT:-2}"
+          cpus: "${VOICE_CPU_LIMIT:-1.0}"
+          memory: ${VOICE_MEMORY_LIMIT:-4G}
 
 networks:
   private:
     internal: true
+  egress: {}
   n8n-shared:
     external: true
-    name: ${N8N_DOCKER_NETWORK}
+    name: ${N8N_DOCKER_NETWORK:?N8N_DOCKER_NETWORK is required}
 
 volumes:
   redis-data:
   render-tmp:
   voice-tmp:
   voice-model-cache:
-

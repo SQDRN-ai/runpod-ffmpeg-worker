@@ -13,12 +13,19 @@ requires CUDA (`WhisperX` + Demucs).
 
 Each API accepts the existing RunPod-shaped request body (`{ "input": { ... } }`)
 and returns RunPod-compatible `id` and `status` fields. n8n can therefore keep
-its polling pattern. Each worker has a dedicated Redis queue and processes one
-job at a time. Outputs continue to be read from and written to Cloudflare R2.
+its polling pattern. Each worker has a dedicated durable Redis queue. A shared
+lock permits only one CPU-heavy render or voice-removal job at a time, preserving
+capacity for n8n and PostgreSQL on the two-vCPU VPS. Interrupted jobs are returned
+to their queue after a worker restart. Outputs continue to be read from and
+written to Cloudflare R2, while per-job temporary media is deleted after each job.
 
 No host port is published. The APIs are reachable only from n8n over its
 existing Docker network as `http://birthday-render-api:8080` and
 `http://birthday-voice-api:8080`.
+
+Workers use a separate egress network for R2 and source downloads. Redis remains
+on an internal-only network. CPU and memory limits are intentionally conservative
+for a 2-vCPU / 8-GB host and must be benchmarked before production cutover.
 
 ## Deploy on the VPS
 
