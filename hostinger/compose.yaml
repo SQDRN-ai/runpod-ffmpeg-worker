@@ -7,14 +7,12 @@ x-api-security: &api-security
   security_opt: ["no-new-privileges:true"]
   tmpfs:
     - "/tmp:size=16m,mode=1777"
-  pids_limit: 128
 
 x-worker-security: &worker-security
   restart: unless-stopped
   read_only: true
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
-  pids_limit: 256
 
 x-worker-environment: &worker-environment
   REDIS_URL: redis://redis:6379/0
