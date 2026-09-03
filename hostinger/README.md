@@ -22,8 +22,9 @@ existing Docker network as `http://birthday-render-api:8080` and
 
 ## Deploy on the VPS
 
-1. Clone this repository in a dedicated directory, then create `.env` from
-   `.env.example` and fill in the real values.
+1. Clone the `codex/hostinger-migration` branch in a dedicated directory, then
+   create `.env` from `.env.example` and fill in the real values. The Docker
+   build explicitly excludes `.env`.
 2. Discover the network attached to the existing n8n container and set
    `N8N_DOCKER_NETWORK` to that exact name.
 3. Start the stack:
