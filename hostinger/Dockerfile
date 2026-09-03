@@ -26,7 +26,8 @@ ENV TORCH_HOME=/models/torch XDG_CACHE_HOME=/models/cache
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.2.2 torchaudio==2.2.2 \
-    && pip install --no-cache-dir "numpy<2" boto3 requests demucs==4.0.1 \
+    && pip install --no-cache-dir "numpy<2" boto3 requests demucs==4.0.1 soundfile==0.12.1 \
+    && python -c "import torchaudio; assert 'soundfile' in torchaudio.list_audio_backends()" \
     && curl --fail --silent --show-error --location \
       "https://raw.githubusercontent.com/SQDRN-ai/runpod-delete-voice/${VOICE_WORKER_REF}/handler.py" \
       --output /app/voice_handler.py \
