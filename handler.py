@@ -1,6 +1,10 @@
 import os
 import re
+import math
+import random
+import shutil
 import subprocess
+import tempfile
 import uuid
 import zipfile
 import runpod
@@ -667,6 +671,350 @@ def _get_canvas(render: dict):
 
 
 # -----------------------------
+# Theme slideshow renderer
+# -----------------------------
+_SLIDESHOW_ANIMATIONS = {
+    "zoom_in", "zoom_out", "pan_left", "pan_right",
+    "pan_up", "pan_down", "static",
+}
+
+_SLIDESHOW_TRANSITIONS = {
+    "fade", "fadeblack", "fadewhite", "smoothleft", "smoothright",
+    "smoothup", "smoothdown", "wipeleft", "wiperight", "wipeup",
+    "wipedown", "circleopen", "circleclose", "dissolve",
+}
+
+
+def _safe_job_component(value) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "job"))
+    return value.strip("-.")[:80] or "job"
+
+
+def _escape_ass_text(value: str) -> str:
+    """Escape user text while retaining explicit newlines as ASS line breaks."""
+    value = str(value).replace("\\", r"\\")
+    value = value.replace("{", r"\{").replace("}", r"\}")
+    return value.replace("\r\n", r"\N").replace("\n", r"\N").replace("\r", r"\N")
+
+
+def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
+    """Build one ASS document containing independently timed theme text events."""
+    if not isinstance(events, list):
+        raise ValueError("render.text_events must be an array")
+
+    header = _ensure_ass_header(play_w, play_h)
+    styles = []
+    dialogues = []
+    for index, raw in enumerate(events):
+        if not isinstance(raw, dict):
+            raise ValueError(f"render.text_events[{index}] must be an object")
+        text = str(raw.get("text", "")).strip()
+        if not text:
+            continue
+
+        start_s = max(0.0, float(raw.get("start_seconds", 0.0)))
+        end_s = max(start_s + 0.05, float(raw.get("end_seconds", start_s + 2.0)))
+        style_name = f"EVENT{index}"
+        font = str(raw.get("font", "Montserrat ExtraBold"))
+        size = int(raw.get("size", 240))
+        alignment = int(raw.get("alignment", 5))
+        x = int(raw.get("x", play_w // 2))
+        y = int(raw.get("y", play_h // 2))
+        fade_in_ms = max(0, int(raw.get("fade_in_ms", 250)))
+        fade_out_ms = max(0, int(raw.get("fade_out_ms", 250)))
+        animation = str(raw.get("animation", "fade")).strip().lower()
+
+        styles.append(_make_style_line(
+            name=style_name,
+            font=font,
+            size=size,
+            primary=str(raw.get("color", "&H00FFFFFF&")),
+            secondary=str(raw.get("secondary_color", "&H0033CCFF&")),
+            outline_col=str(raw.get("outline_color", "&H00000000&")),
+            back_col=str(raw.get("back_color", "&H00000000&")),
+            spacing=float(raw.get("spacing", 1)),
+            outline=float(raw.get("outline", 12)),
+            shadow=float(raw.get("shadow", 4)),
+            alignment=alignment,
+            margin_l=0,
+            margin_r=0,
+            margin_v=0,
+        ))
+
+        duration_ms = max(50, int(round((end_s - start_s) * 1000)))
+        tags = [f"\\an{alignment}", f"\\pos({x},{y})", f"\\fad({fade_in_ms},{fade_out_ms})"]
+        if animation == "pop":
+            pop_ms = min(450, max(100, duration_ms // 4))
+            tags.extend([
+                "\\fscx70\\fscy70",
+                f"\\t(0,{pop_ms},\\fscx110\\fscy110)",
+                f"\\t({pop_ms},{min(duration_ms, pop_ms * 2)},\\fscx100\\fscy100)",
+            ])
+        elif animation == "pulse":
+            midpoint = max(100, duration_ms // 2)
+            tags.extend([
+                f"\\t(0,{midpoint},\\fscx108\\fscy108)",
+                f"\\t({midpoint},{duration_ms},\\fscx100\\fscy100)",
+            ])
+
+        dialogues.append(
+            "Dialogue: 20,{start},{end},{style},,0000,0000,0000,,{{{tags}}}{text}\n".format(
+                start=seconds_to_ass_time(start_s),
+                end=seconds_to_ass_time(end_s),
+                style=style_name,
+                tags="".join(tags),
+                text=_escape_ass_text(text),
+            )
+        )
+
+    if not dialogues:
+        return ""
+    events_header = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    return header + "".join(styles) + "\n" + events_header + "".join(dialogues)
+
+
+def _slideshow_zoompan(animation: str, frames: int, zoom_speed: float) -> tuple[str, str, str]:
+    animation = animation if animation in _SLIDESHOW_ANIMATIONS else "zoom_in"
+    frames = max(1, int(frames))
+    speed = max(0.00005, min(float(zoom_speed), 0.01))
+    progress = f"min(1,on/{frames})"
+
+    if animation == "zoom_out":
+        return (f"if(eq(on,0),1.12,max(1.001,zoom-{speed:.6f}))", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)")
+    if animation == "pan_left":
+        return ("1.10", f"(iw-iw/zoom)*(1-{progress})", "(ih-ih/zoom)/2")
+    if animation == "pan_right":
+        return ("1.10", f"(iw-iw/zoom)*({progress})", "(ih-ih/zoom)/2")
+    if animation == "pan_up":
+        return ("1.10", "(iw-iw/zoom)/2", f"(ih-ih/zoom)*(1-{progress})")
+    if animation == "pan_down":
+        return ("1.10", "(iw-iw/zoom)/2", f"(ih-ih/zoom)*({progress})")
+    if animation == "static":
+        return ("1.001", "(iw-iw/zoom)/2", "(ih-ih/zoom)/2")
+    return (f"min(zoom+{speed:.6f},1.12)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)")
+
+
+def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w: int, play_h: int):
+    image_keys = inp.get("image_keys")
+    music_key = inp.get("music_key")
+    if not isinstance(image_keys, list) or not image_keys or not all(isinstance(k, str) and k.strip() for k in image_keys):
+        return {"error": "Missing required input image_keys (non-empty string array)."}
+    if not music_key:
+        return {"error": "Missing required input music_key."}
+
+    slideshow_cfg = render.get("slideshow", {}) or {}
+    video_cfg = render.get("video", {}) or {}
+    audio_cfg = render.get("audio", {}) or {}
+    intro_cfg = render.get("intro", {}) or {}
+    thumb_cfg = render.get("thumbnail", None)
+
+    fps = max(1, min(int(slideshow_cfg.get("fps", 30)), 60))
+    preferred_hold = max(1.0, float(slideshow_cfg.get("image_duration_seconds", 5.0)))
+    transition_seconds = max(0.0, float(slideshow_cfg.get("transition_seconds", 0.6)))
+    zoom_speed = float(slideshow_cfg.get("zoom_speed", 0.00035))
+    seed = int(slideshow_cfg.get("seed", 0) or 0)
+    randomizer = random.Random(seed)
+    requested_animations = slideshow_cfg.get("animations", []) or []
+    requested_transitions = slideshow_cfg.get("transitions", []) or []
+
+    intro_enabled = bool(intro_cfg.get("enabled", False))
+    intro_seconds = max(0.0, float(intro_cfg.get("length_seconds", 0.0))) if intro_enabled else 0.0
+    end_pad_seconds = max(0.0, float(render.get("end_pad_seconds", 0.3)))
+
+    job_dir = tempfile.mkdtemp(prefix=f"birthday-theme-{_safe_job_component(job_id)}-", dir="/tmp")
+    music_path = os.path.join(job_dir, "music.mp3")
+    out_path = os.path.join(job_dir, "final.mp4")
+    text_ass_path = os.path.join(job_dir, "text-events.ass")
+    supplied_ass_path = os.path.join(job_dir, "overlay.ass")
+    intro_bgm_path = os.path.join(job_dir, "intro-bgm.mp3")
+    image_paths = []
+
+    try:
+        for index, key in enumerate(image_keys):
+            ext = os.path.splitext(key)[1].lower()
+            if ext not in {".jpg", ".jpeg", ".png", ".webp", ".avif"}:
+                ext = ".img"
+            local_path = os.path.join(job_dir, f"image-{index:03d}{ext}")
+            download_from_r2(key, local_path)
+            image_paths.append(local_path)
+        download_from_r2(music_key, music_path)
+
+        measured_music_duration = get_media_duration_seconds(music_path)
+        supplied_music_duration = float(inp.get("audio_duration_seconds", 0.0) or 0.0)
+        music_duration = measured_music_duration if measured_music_duration > 0 else supplied_music_duration
+        if music_duration <= 0:
+            return {"error": "Could not determine music duration."}
+
+        total_duration = intro_seconds + music_duration + end_pad_seconds
+        image_count = len(image_paths)
+        transition_seconds = min(transition_seconds, preferred_hold / 2.0)
+        if image_count == 1:
+            transition_seconds = 0.0
+        segment_duration = (total_duration + (image_count - 1) * transition_seconds) / image_count
+        segment_frames = max(1, int(math.ceil(segment_duration * fps)))
+
+        animations = []
+        for index in range(image_count):
+            candidate = requested_animations[index] if index < len(requested_animations) else randomizer.choice(sorted(_SLIDESHOW_ANIMATIONS - {"static"}))
+            animations.append(candidate if candidate in _SLIDESHOW_ANIMATIONS else "zoom_in")
+
+        transitions = []
+        for index in range(max(0, image_count - 1)):
+            candidate = requested_transitions[index] if index < len(requested_transitions) else randomizer.choice(["fade", "dissolve", "smoothleft", "smoothright"])
+            transitions.append(candidate if candidate in _SLIDESHOW_TRANSITIONS else "fade")
+
+        cmd = ["ffmpeg", "-y"]
+        for image_path in image_paths:
+            cmd += ["-loop", "1", "-framerate", str(fps), "-t", f"{segment_duration:.6f}", "-i", image_path]
+        music_input_index = image_count
+        cmd += ["-i", music_path]
+
+        intro_bgm_input_index = None
+        intro_bgm_key = intro_cfg.get("bgm_key") if intro_enabled else None
+        if intro_bgm_key:
+            download_from_r2(intro_bgm_key, intro_bgm_path)
+            intro_bgm_input_index = music_input_index + 1
+            cmd += ["-i", intro_bgm_path]
+
+        fc = []
+        video_labels = []
+        for index, animation in enumerate(animations):
+            label = f"slide{index}"
+            fc.append(
+                f"[{index}:v]scale={play_w}:{play_h}:force_original_aspect_ratio=increase,"
+                f"crop={play_w}:{play_h},setsar=1,trim=duration={segment_duration:.6f},"
+                f"fps={fps},format=yuv420p[{label}]"
+            )
+            video_labels.append(f"[{label}]")
+
+        current_video = video_labels[0]
+        if image_count > 1:
+            for index in range(1, image_count):
+                out_label = f"xfade{index}"
+                offset = index * (segment_duration - transition_seconds)
+                fc.append(
+                    f"{current_video}{video_labels[index]}xfade=transition={transitions[index - 1]}:"
+                    f"duration={transition_seconds:.6f}:offset={offset:.6f}[{out_label}]"
+                )
+                current_video = f"[{out_label}]"
+
+        # Applying zoompan after xfade avoids FFmpeg's undefined-frame-rate output
+        # from zoompan being rejected by xfade, while every still remains in motion.
+        motion_period = max(1, segment_frames)
+        global_zoom = f"1.001+0.079*abs(sin(on/{motion_period}*PI))"
+        video_filter_tail = [
+            f"zoompan=z='{global_zoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={play_w}x{play_h}:fps={fps}",
+            f"trim=duration={total_duration:.6f}",
+            "setpts=PTS-STARTPTS",
+        ]
+
+        supplied_ass_key = inp.get("overlay_ass_key")
+        if supplied_ass_key:
+            download_from_r2(supplied_ass_key, supplied_ass_path)
+            supplied_filter = f"subtitles={supplied_ass_path}"
+            if fontsdir:
+                supplied_filter += f":fontsdir={fontsdir}"
+            video_filter_tail.append(supplied_filter)
+
+        generated_ass = _make_text_events_ass(render.get("text_events", []) or [], play_w, play_h)
+        if generated_ass:
+            with open(text_ass_path, "w", encoding="utf-8") as handle:
+                handle.write(generated_ass)
+            generated_filter = f"subtitles={text_ass_path}"
+            if fontsdir:
+                generated_filter += f":fontsdir={fontsdir}"
+            video_filter_tail.append(generated_filter)
+
+        fc.append(f"{current_video}{','.join(video_filter_tail)}[vout]")
+
+        song_chain = f"[{music_input_index}:a]asetpts=PTS-STARTPTS"
+        if audio_cfg.get("volume") is not None:
+            song_chain += f",volume={float(audio_cfg['volume'])}"
+        song_chain += "[songa]"
+        fc.append(song_chain)
+
+        if intro_seconds > 0:
+            if intro_bgm_input_index is not None:
+                fade_duration = min(0.4, intro_seconds)
+                fc.append(
+                    f"[{intro_bgm_input_index}:a]atrim=0:{intro_seconds:.6f},asetpts=PTS-STARTPTS,"
+                    f"afade=t=out:st={max(0.0, intro_seconds - fade_duration):.6f}:d={fade_duration:.6f}[introa]"
+                )
+            else:
+                fc.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{intro_seconds:.6f}[introa]")
+            fc.append("[introa][songa]concat=n=2:v=0:a=1[basea]")
+        else:
+            fc.append("[songa]anull[basea]")
+
+        if end_pad_seconds > 0:
+            fc.append(f"[basea]apad=pad_dur={end_pad_seconds:.6f}[aout]")
+        else:
+            fc.append("[basea]anull[aout]")
+
+        filter_complex = ";".join(fc)
+        cmd += [
+            "-filter_complex", filter_complex,
+            "-map", "[vout]", "-map", "[aout]",
+            "-c:v", str(video_cfg.get("codec", "libx264")),
+            "-preset", str(video_cfg.get("preset", "medium")),
+            "-crf", str(video_cfg.get("crf", 18)),
+            "-pix_fmt", str(video_cfg.get("pix_fmt", "yuv420p")),
+            "-r", str(fps),
+            "-c:a", str(audio_cfg.get("codec", "aac")),
+            "-b:a", str(audio_cfg.get("bitrate", "192k")),
+            "-movflags", "+faststart",
+            "-t", f"{total_duration:.6f}", out_path,
+        ]
+
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        if process.returncode != 0:
+            return {"error": "slideshow ffmpeg failed", "returncode": process.returncode, "stderr": process.stderr[-20000:], "cmd": cmd, "filter_complex": filter_complex}
+
+        check_start = intro_seconds + min(2.0, max(0.0, music_duration / 4.0))
+        check_duration = min(8.0, max(1.0, music_duration - (check_start - intro_seconds)))
+        audio_ok, audio_check = validate_output_audio_after_intro(
+            out_path, start_s=check_start, check_duration_s=check_duration,
+            silence_threshold_db=float(audio_cfg.get("post_audio_silence_threshold_db", -55.0)),
+        )
+        if not audio_ok:
+            return {"error": "slideshow output audio validation failed", "audio_check": audio_check, "ffmpeg_stderr_tail": process.stderr[-20000:]}
+
+        out_key = inp.get("out_key") or (f"jobs/{job_id}/final.mp4" if job_id else f"outputs/{uuid.uuid4().hex}.mp4")
+        uploaded = upload_to_r2(out_path, out_key)
+
+        thumbnail_result = None
+        thumbnail_cmd = None
+        if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
+            effective_thumb_cfg = dict(thumb_cfg)
+            effective_thumb_cfg.setdefault("background_key", image_keys[0])
+            thumbnail_result, thumbnail_cmd = _render_thumbnail(
+                thumb_cfg=effective_thumb_cfg, job_id=job_id,
+                name_cfg=render.get("name_overlay", None), fontsdir=fontsdir,
+            )
+
+        return {
+            "status": "ok", "mode": "render_slideshow", "jobId": job_id,
+            "out_key": out_key, "uploaded": uploaded,
+            "thumbnail_uploaded": thumbnail_result, "thumbnail_ffmpeg_cmd": thumbnail_cmd,
+            "canvas": {"width": play_w, "height": play_h}, "fps": fps,
+            "image_count": image_count, "image_keys": image_keys,
+            "animations": animations, "transitions": transitions, "seed": seed,
+            "preferred_image_duration_seconds": preferred_hold,
+            "actual_segment_duration_seconds": segment_duration,
+            "transition_seconds": transition_seconds,
+            "supplied_audio_duration_seconds": supplied_music_duration,
+            "measured_audio_duration_seconds": measured_music_duration,
+            "intro_seconds": intro_seconds, "total_duration_seconds": total_duration,
+            "overlay_ass_used": bool(supplied_ass_key),
+            "generated_text_events_used": bool(generated_ass),
+            "audio_validation": audio_check, "ffmpeg_cmd": cmd,
+            "filter_complex": filter_complex, "ffmpeg_stderr_tail": process.stderr[-20000:],
+        }
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# -----------------------------
 # Thumbnail renderer
 # -----------------------------
 def _render_thumbnail(*, thumb_cfg: dict, job_id, name_cfg, fontsdir: str):
@@ -774,8 +1122,8 @@ def handler(event):
     try:
         inp = (event or {}).get("input", {}) or {}
         mode = inp.get("mode", "render")
-        if mode not in ("render", "thumbnail"):
-            return {"error": f"Unknown mode: {mode}. Use mode='render' or mode='thumbnail'."}
+        if mode not in ("render", "render_slideshow", "thumbnail"):
+            return {"error": f"Unknown mode: {mode}. Use mode='render', mode='render_slideshow', or mode='thumbnail'."}
 
         job_id = inp.get("jobId")
         render = inp.get("render", {}) or {}
@@ -832,6 +1180,16 @@ def handler(event):
                 "fontsdir_used": fontsdir,
                 "canvas": {"width": play_w, "height": play_h},
             }
+
+        if mode == "render_slideshow":
+            return _render_slideshow(
+                inp=inp,
+                render=render,
+                job_id=job_id,
+                fontsdir=fontsdir,
+                play_w=play_w,
+                play_h=play_h,
+            )
 
         # Render mode inputs
         video_key = inp.get("video_key")

@@ -58,7 +58,8 @@ services:
       redis:
         condition: service_healthy
     build:
-      context: .
+      context: ..
+      dockerfile: hostinger/Dockerfile
       target: render
     environment:
       WORKER_KIND: render
@@ -85,7 +86,8 @@ services:
       redis:
         condition: service_healthy
     build:
-      context: .
+      context: ..
+      dockerfile: hostinger/Dockerfile
       target: render
     command: ["python", "-m", "app.entrypoint", "worker"]
     environment:
@@ -106,7 +108,8 @@ services:
       redis:
         condition: service_healthy
     build:
-      context: .
+      context: ..
+      dockerfile: hostinger/Dockerfile
       target: voice
     environment:
       WORKER_KIND: voice
@@ -133,7 +136,8 @@ services:
       redis:
         condition: service_healthy
     build:
-      context: .
+      context: ..
+      dockerfile: hostinger/Dockerfile
       target: voice
     command: ["python", "-m", "app.entrypoint", "worker"]
     environment:

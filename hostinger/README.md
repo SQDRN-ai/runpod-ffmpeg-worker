@@ -6,6 +6,11 @@ by RunPod:
 - `render-*`: the 4K FFmpeg video and thumbnail renderer;
 - `voice-*`: Demucs-based vocal removal / instrumental creation.
 
+The render handler also supports a separate `render_slideshow` mode for themed
+videos. It composes R2-hosted still images into a duration-matched video, adds
+motion, transitions, timed ASS/text overlays, optional intro audio, and an
+optional thumbnail. The existing `render` mode is unchanged.
+
 The karaoke aligner intentionally remains on RunPod because its current handler
 requires CUDA (`WhisperX` + Demucs).
 
@@ -22,6 +27,54 @@ written to Cloudflare R2, while per-job temporary media is deleted after each jo
 No host port is published. The APIs are reachable only from n8n over its
 existing Docker network as `http://birthday-render-api:8080` and
 `http://birthday-voice-api:8080`.
+
+## Themed slideshow payload
+
+Submit slideshow jobs to the same render API. `audio_duration_seconds` is a
+planning hint; the worker verifies the downloaded audio with FFprobe before it
+renders.
+
+```json
+{
+  "input": {
+    "mode": "render_slideshow",
+    "jobId": "age-party-25",
+    "music_key": "jobs/example/song.mp3",
+    "audio_duration_seconds": 42.8,
+    "image_keys": [
+      "visual-assets/party/image-001.webp",
+      "visual-assets/party/image-002.webp"
+    ],
+    "overlay_ass_key": "jobs/example/age-overlay.ass",
+    "out_key": "jobs/example/final.mp4",
+    "render": {
+      "canvas": {"width": 3840, "height": 2160},
+      "slideshow": {
+        "fps": 30,
+        "image_duration_seconds": 5,
+        "transition_seconds": 0.6,
+        "seed": 25
+      },
+      "text_events": [
+        {
+          "text": "HAPPY 25TH BIRTHDAY",
+          "start_seconds": 0.4,
+          "end_seconds": 4.5,
+          "animation": "pop"
+        }
+      ],
+      "thumbnail": {
+        "enabled": true,
+        "background_key": "visual-assets/party/image-001.webp",
+        "name_text": {"text": "25TH"}
+      }
+    }
+  }
+}
+```
+
+At least one `image_keys` entry and one `music_key` are required. A supplied
+`overlay_ass_key` is optional and is intended for word-aligned age highlights.
 
 Workers use a separate egress network for R2 and source downloads. Redis remains
 on an internal-only network. The default limits target a 4-vCPU / 16-GB Hostinger

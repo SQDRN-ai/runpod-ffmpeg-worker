@@ -5,19 +5,16 @@ FROM python:3.11-slim AS base
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-COPY requirements-api.txt /app/
+COPY hostinger/requirements-api.txt /app/
 RUN pip install --no-cache-dir -r requirements-api.txt
-COPY app /app/app
+COPY hostinger/app /app/app
 
 FROM base AS render
-ARG FFMPEG_WORKER_REF=1f450adf3ff5e54e124c5199e3e1c3c86cd16531
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir boto3==1.34.0 \
-    && curl --fail --silent --show-error --location \
-      "https://raw.githubusercontent.com/SQDRN-ai/runpod-ffmpeg-worker/${FFMPEG_WORKER_REF}/handler.py" \
-      --output /app/render_handler.py \
-    && sed -i '/^import runpod$/d; /runpod\.serverless\.start/d' /app/render_handler.py
+    && pip install --no-cache-dir boto3==1.34.0
+COPY handler.py /app/render_handler.py
+RUN sed -i '/^import runpod$/d; /runpod\.serverless\.start/d' /app/render_handler.py
 CMD ["python", "-m", "app.entrypoint", "api"]
 
 FROM base AS voice
