@@ -106,6 +106,7 @@ class SlideshowIntegrationTest(unittest.TestCase):
             self.assertEqual(result.get("status"), "ok", result)
             self.assertEqual(result.get("mode"), "render_slideshow")
             self.assertEqual(result.get("image_count"), 2)
+            self.assertEqual(result.get("work_canvas"), {"width": 640, "height": 360})
             self.assertTrue(result.get("generated_text_events_used"))
             self.assertTrue(os.path.exists(uploaded_video))
             self.assertTrue(os.path.exists(uploaded_thumbnail))

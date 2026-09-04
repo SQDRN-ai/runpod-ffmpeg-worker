@@ -809,6 +809,12 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
     thumb_cfg = render.get("thumbnail", None)
 
     fps = max(1, min(int(slideshow_cfg.get("fps", 30)), 60))
+    # Keep multi-input transitions within the Theme worker's memory limit. The
+    # final zoompan stage still emits the requested 4K canvas, but xfade no
+    # longer has to retain several 4K frames for every source image.
+    work_scale = min(1.0, 1920.0 / play_w, 1080.0 / play_h)
+    work_w = max(2, (int(play_w * work_scale) // 2) * 2)
+    work_h = max(2, (int(play_h * work_scale) // 2) * 2)
     preferred_hold = max(1.0, float(slideshow_cfg.get("image_duration_seconds", 5.0)))
     transition_seconds = max(0.0, float(slideshow_cfg.get("transition_seconds", 0.6)))
     zoom_speed = float(slideshow_cfg.get("zoom_speed", 0.00035))
@@ -881,8 +887,8 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
         for index, animation in enumerate(animations):
             label = f"slide{index}"
             fc.append(
-                f"[{index}:v]scale={play_w}:{play_h}:force_original_aspect_ratio=increase,"
-                f"crop={play_w}:{play_h},setsar=1,trim=duration={segment_duration:.6f},"
+                f"[{index}:v]scale={work_w}:{work_h}:force_original_aspect_ratio=increase,"
+                f"crop={work_w}:{work_h},setsar=1,trim=duration={segment_duration:.6f},"
                 f"fps={fps},format=yuv420p[{label}]"
             )
             video_labels.append(f"[{label}]")
@@ -997,6 +1003,7 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
             "out_key": out_key, "uploaded": uploaded,
             "thumbnail_uploaded": thumbnail_result, "thumbnail_ffmpeg_cmd": thumbnail_cmd,
             "canvas": {"width": play_w, "height": play_h}, "fps": fps,
+            "work_canvas": {"width": work_w, "height": work_h},
             "image_count": image_count, "image_keys": image_keys,
             "animations": animations, "transitions": transitions, "seed": seed,
             "preferred_image_duration_seconds": preferred_hold,
