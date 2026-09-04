@@ -151,7 +151,7 @@ services:
       resources:
         limits:
           cpus: "${THEME_CPU_LIMIT:-2.5}"
-          memory: ${THEME_MEMORY_LIMIT:-3G}
+          memory: ${THEME_MEMORY_LIMIT:-6G}
 
   voice-api:
     <<: *api-security
