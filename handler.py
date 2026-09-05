@@ -1066,7 +1066,10 @@ def _render_thumbnail(*, thumb_cfg: dict, job_id, name_cfg, fontsdir: str):
         if not resolved_fontfile and fontfile_name and fontsdir:
             resolved_fontfile = _find_font_file(fontsdir, fontfile_name)
 
-        fontsize = int(name_text_cfg.get("fontsize", 220))
+        # Preserve the visual proportion of the historical 1920px-wide
+        # thumbnail when a theme has not chosen an explicit font size.
+        default_fontsize = max(1, int(round(220 * (tw / 1920))))
+        fontsize = int(name_text_cfg.get("fontsize", default_fontsize))
         fontcolor = str(name_text_cfg.get("color", "#FFFFFF"))
         x_expr = str(name_text_cfg.get("x", "(w-text_w)/2"))
         y_expr = str(name_text_cfg.get("y", "(h-text_h)/2"))
