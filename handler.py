@@ -2,6 +2,7 @@ import os
 import re
 import math
 import random
+import colorsys
 import shutil
 import subprocess
 import tempfile
@@ -675,13 +676,14 @@ def _get_canvas(render: dict):
 # -----------------------------
 _SLIDESHOW_ANIMATIONS = {
     "zoom_in", "zoom_out", "pan_left", "pan_right",
-    "pan_up", "pan_down", "static",
+    "pan_up", "pan_down", "stamp", "static",
 }
 
 _SLIDESHOW_TRANSITIONS = {
     "fade", "fadeblack", "fadewhite", "smoothleft", "smoothright",
     "smoothup", "smoothdown", "wipeleft", "wiperight", "wipeup",
-    "wipedown", "circleopen", "circleclose", "dissolve",
+    "wipedown", "circleopen", "circleclose", "dissolve", "zoomin",
+    "squeezeh", "squeezev", "pixelize", "hblur", "diagtl", "diagtr",
 }
 
 
@@ -695,6 +697,76 @@ def _escape_ass_text(value: str) -> str:
     value = str(value).replace("\\", r"\\")
     value = value.replace("{", r"\{").replace("}", r"\}")
     return value.replace("\r\n", r"\N").replace("\n", r"\N").replace("\r", r"\N")
+
+
+def _choose_text_palette_color(image_path: str, fallback_index: int) -> dict:
+    """Derive a darker vivid text color from a still's dominant hue.
+
+    White outlining and a dark shadow provide contrast even for busy party
+    artwork, so the foreground can stay connected to its visual palette.
+    """
+    fallback_hue = (0.57 + fallback_index * 0.17) % 1.0
+    try:
+        process = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-i", image_path,
+                "-vf", "scale=48:27:flags=area,format=rgb24",
+                "-frames:v", "1", "-f", "rawvideo", "-",
+            ],
+            capture_output=True,
+            check=False,
+        )
+        data = process.stdout
+        if process.returncode != 0 or len(data) < 3:
+            raise RuntimeError("could not sample image color")
+
+        bins = [0.0] * 24
+        for offset in range(0, len(data) - 2, 3):
+            r, g, b = data[offset], data[offset + 1], data[offset + 2]
+            hue, saturation, value = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+            if saturation < 0.28 or value < 0.22:
+                continue
+            bins[min(len(bins) - 1, int(hue * len(bins)))] += saturation * value
+        best_index, best_score = max(enumerate(bins), key=lambda pair: pair[1])
+        hue = ((best_index + 0.5) / len(bins)) if best_score > 0 else fallback_hue
+    except Exception:
+        hue = fallback_hue
+
+    # High saturation preserves the festive quality; 72% value keeps it darker
+    # than a neon foreground and lets the white edge do its job.
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.90, 0.72)
+    red, green, blue = (int(round(channel * 255)) for channel in (r, g, b))
+
+    return {
+        "name": f"sampled_hue_{int(round(hue * 360)) % 360}",
+        "ass_color": f"&H00{blue:02X}{green:02X}{red:02X}&",
+        "outline_color": "&H00FFFFFF&",
+        "shadow_color": "&H00000000&",
+    }
+
+
+def _resolve_auto_palette_text_events(events: list, palette: list[dict]) -> list[dict]:
+    """Resolve opt-in auto-palette event colors after stills have been sampled."""
+    resolved = []
+    for raw in events if isinstance(events, list) else []:
+        if not isinstance(raw, dict):
+            resolved.append(raw)
+            continue
+        event = dict(raw)
+        if str(event.get("color", "")).strip().lower() in {"auto", "auto_palette"} and palette:
+            try:
+                palette_index = int(event.get("palette_index", 0)) % len(palette)
+            except (TypeError, ValueError):
+                palette_index = 0
+            choice = palette[palette_index]
+            event["color"] = choice["ass_color"]
+            # Text that delegates palette choice always keeps a white edge and
+            # a strong dark shadow on top of rich, busy backgrounds.
+            event["outline_color"] = choice["outline_color"]
+            event["back_color"] = choice["shadow_color"]
+            event["shadow"] = max(12, float(event.get("shadow", 0)))
+        resolved.append(event)
+    return resolved
 
 
 def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
@@ -750,6 +822,14 @@ def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
                 "\\fscx70\\fscy70",
                 f"\\t(0,{pop_ms},\\fscx110\\fscy110)",
                 f"\\t({pop_ms},{min(duration_ms, pop_ms * 2)},\\fscx100\\fscy100)",
+            ])
+        elif animation == "stamp":
+            stamp_ms = min(380, max(130, duration_ms // 5))
+            settle_ms = min(duration_ms, stamp_ms * 3)
+            tags.extend([
+                "\\fscx42\\fscy42",
+                f"\\t(0,{stamp_ms},\\fscx126\\fscy126)",
+                f"\\t({stamp_ms},{settle_ms},\\fscx100\\fscy100)",
             ])
         elif animation == "pulse":
             midpoint = max(100, duration_ms // 2)
@@ -811,6 +891,36 @@ def _slideshow_zoompan(animation: str, frames: int, zoom_speed: float) -> tuple[
     return (f"min(zoom+{speed:.6f},1.12)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)")
 
 
+def _slideshow_motion_expressions(animation: str, frames: int) -> tuple[str, str, str]:
+    """Return a strong continuous motion path for one slideshow block."""
+    animation = animation if animation in _SLIDESHOW_ANIMATIONS else "zoom_in"
+    frames = max(1, int(frames))
+    progress = f"(mod(on,{frames})/{frames})"
+    center_x = "(iw-iw/zoom)/2"
+    center_y = "(ih-ih/zoom)/2"
+
+    if animation == "zoom_out":
+        return (f"1.11-0.105*{progress}", center_x, center_y)
+    if animation == "pan_left":
+        return ("1.10", f"(iw-iw/zoom)*(1-{progress})", center_y)
+    if animation == "pan_right":
+        return ("1.10", f"(iw-iw/zoom)*{progress}", center_y)
+    if animation == "pan_up":
+        return ("1.10", center_x, f"(ih-ih/zoom)*(1-{progress})")
+    if animation == "pan_down":
+        return ("1.10", center_x, f"(ih-ih/zoom)*{progress}")
+    if animation == "stamp":
+        return (
+            f"if(lt({progress},0.12),1.001+0.139*{progress}/0.12,"
+            f"1.14-0.060*(({progress}-0.12)/0.88))",
+            center_x,
+            center_y,
+        )
+    if animation == "static":
+        return ("1.055", center_x, center_y)
+    return (f"1.001+0.105*{progress}", center_x, center_y)
+
+
 def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w: int, play_h: int):
     image_keys = inp.get("image_keys")
     music_key = inp.get("music_key")
@@ -835,7 +945,12 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
     preferred_hold = max(1.0, float(slideshow_cfg.get("image_duration_seconds", 5.0)))
     transition_seconds = max(0.0, float(slideshow_cfg.get("transition_seconds", 0.6)))
     zoom_speed = float(slideshow_cfg.get("zoom_speed", 0.00035))
-    seed = int(slideshow_cfg.get("seed", 0) or 0)
+    configured_seed = slideshow_cfg.get("seed")
+    seed = (
+        int(configured_seed)
+        if configured_seed not in (None, "")
+        else random.SystemRandom().randint(1, 2_147_483_647)
+    )
     randomizer = random.Random(seed)
     requested_animations = slideshow_cfg.get("animations", []) or []
     requested_transitions = slideshow_cfg.get("transitions", []) or []
@@ -861,6 +976,10 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
             download_from_r2(key, local_path)
             image_paths.append(local_path)
         download_from_r2(music_key, music_path)
+        text_palette = [
+            _choose_text_palette_color(path, index)
+            for index, path in enumerate(image_paths)
+        ]
 
         measured_music_duration = get_media_duration_seconds(music_path)
         supplied_music_duration = float(inp.get("audio_duration_seconds", 0.0) or 0.0)
@@ -876,14 +995,40 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
         segment_duration = (total_duration + (image_count - 1) * transition_seconds) / image_count
         segment_frames = max(1, int(math.ceil(segment_duration * fps)))
 
+        def varied_choices(options: list[str], count: int) -> list[str]:
+            """Draw shuffled cycles so one render visibly varies its moves."""
+            result = []
+            while len(result) < count:
+                cycle = list(options)
+                randomizer.shuffle(cycle)
+                result.extend(cycle)
+            return result[:count]
+
+        default_animations = varied_choices(
+            sorted(_SLIDESHOW_ANIMATIONS - {"static"}), image_count,
+        )
         animations = []
         for index in range(image_count):
-            candidate = requested_animations[index] if index < len(requested_animations) else randomizer.choice(sorted(_SLIDESHOW_ANIMATIONS - {"static"}))
+            candidate = (
+                requested_animations[index]
+                if index < len(requested_animations)
+                else default_animations[index]
+            )
             animations.append(candidate if candidate in _SLIDESHOW_ANIMATIONS else "zoom_in")
 
+        default_transitions = varied_choices(
+            ["fade", "dissolve", "smoothleft", "smoothright", "smoothup", "smoothdown",
+             "zoomin", "squeezeh", "squeezev", "pixelize", "hblur", "circleopen",
+             "diagtl", "diagtr"],
+            max(0, image_count - 1),
+        ) if image_count > 1 else []
         transitions = []
         for index in range(max(0, image_count - 1)):
-            candidate = requested_transitions[index] if index < len(requested_transitions) else randomizer.choice(["fade", "dissolve", "smoothleft", "smoothright"])
+            candidate = (
+                requested_transitions[index]
+                if index < len(requested_transitions)
+                else default_transitions[index]
+            )
             transitions.append(candidate if candidate in _SLIDESHOW_TRANSITIONS else "fade")
 
         cmd = ["ffmpeg", "-y"]
@@ -921,21 +1066,24 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
                 )
                 current_video = f"[{out_label}]"
 
-        # Apply the moving crop after xfade. This retains xfade's stable CFR
-        # inputs while changing pan direction for every image-length block.
-        # The motion never rests, including during crossfades.
-        motion_period = max(1, segment_frames)
-        progress = f"(mod(on,{motion_period})/{motion_period})"
-        direction = f"mod(floor(on/{motion_period}),4)"
-        global_zoom = f"1.001+0.079*abs(sin({progress}*PI))"
-        x_position = (
-            f"if(eq({direction},1),(iw-iw/zoom)*{progress},"
-            f"if(eq({direction},2),(iw-iw/zoom)*(1-{progress}),(iw-iw/zoom)/2))"
-        )
-        y_position = (
-            f"if(eq({direction},3),(ih-ih/zoom)*{progress},"
-            f"if(eq({direction},0),(ih-ih/zoom)*(1-{progress}),(ih-ih/zoom)/2))"
-        )
+        # Apply movement after xfade, preserving stable CFR transition inputs.
+        # Pick the movement per image block from the randomized animation list.
+        motion_period = max(1, int(round((segment_duration - transition_seconds) * fps)))
+        motion_index = f"mod(floor(on/{motion_period}),{image_count})"
+        motion_paths = [
+            _slideshow_motion_expressions(animation, motion_period)
+            for animation in animations
+        ]
+
+        def choose_motion_component(component_index: int) -> str:
+            selected = motion_paths[-1][component_index]
+            for index in range(image_count - 2, -1, -1):
+                selected = f"if(eq({motion_index},{index}),{motion_paths[index][component_index]},{selected})"
+            return selected
+
+        global_zoom = choose_motion_component(0)
+        x_position = choose_motion_component(1)
+        y_position = choose_motion_component(2)
         video_filter_tail = [
             f"zoompan=z='{global_zoom}':x='{x_position}':y='{y_position}':d=1:"
             f"s={play_w}x{play_h}:fps={fps}",
@@ -951,7 +1099,10 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
                 supplied_filter += f":fontsdir={fontsdir}"
             video_filter_tail.append(supplied_filter)
 
-        generated_ass = _make_text_events_ass(render.get("text_events", []) or [], play_w, play_h)
+        text_events = _resolve_auto_palette_text_events(
+            render.get("text_events", []) or [], text_palette,
+        )
+        generated_ass = _make_text_events_ass(text_events, play_w, play_h)
         if generated_ass:
             with open(text_ass_path, "w", encoding="utf-8") as handle:
                 handle.write(generated_ass)
@@ -1034,6 +1185,7 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
             "canvas": {"width": play_w, "height": play_h}, "fps": fps,
             "work_canvas": {"width": work_w, "height": work_h},
             "image_count": image_count, "image_keys": image_keys,
+            "text_palette": text_palette,
             "animations": animations, "transitions": transitions, "seed": seed,
             "preferred_image_duration_seconds": preferred_hold,
             "actual_segment_duration_seconds": segment_duration,
@@ -1296,105 +1448,3 @@ def handler(event):
 
         loop_video = bool(timing_cfg.get("loop_video", False))
 
-        video_cfg = render.get("video", {}) or {}
-        audio_cfg = render.get("audio", {}) or {}
-
-        v_codec = video_cfg.get("codec", "libx264")
-        v_preset = video_cfg.get("preset", "medium")
-        v_crf = str(video_cfg.get("crf", 18))
-        v_pix_fmt = video_cfg.get("pix_fmt", "yuv420p")
-        v_profile = video_cfg.get("profile", "high")
-        v_tune = video_cfg.get("tune", None)
-        v_scale = video_cfg.get("scale", None)
-        faststart = bool(video_cfg.get("movflags_faststart", True))
-
-        a_codec = audio_cfg.get("codec", "aac")
-        a_bitrate = audio_cfg.get("bitrate", "192k")
-        a_volume = audio_cfg.get("volume", None)
-
-        # Download base assets
-        download_from_r2(video_key, TMP_IN)
-        download_from_r2(ass_key, TMP_ASS)
-        download_from_r2(music_key, TMP_MUSIC)
-
-        hb_voice_dur = 0.0
-        intro_len = 0.0
-        hb_voice_available = False
-
-        # Intro assets (and compute dynamic intro length)
-        if intro_enabled:
-            missing = [k for k in ["bgm_key", "countdown_key", "hb_voice_key"] if not intro_cfg.get(k)]
-            if missing:
-                return {"error": "intro.enabled is true but missing intro keys", "missing": missing}
-
-            download_from_r2(intro_cfg["bgm_key"], TMP_INTRO_BGM)
-            download_from_r2(intro_cfg["countdown_key"], TMP_COUNTDOWN_VO)
-            download_from_r2(intro_cfg["hb_voice_key"], TMP_HB_VO)
-
-            hb_voice_dur = max(0.0, get_media_duration_seconds(TMP_HB_VO))
-            hb_voice_available = hb_voice_dur > 0.0
-
-            # Dynamic intro length: minimum vs spoken audio length
-            intro_len = max(
-                intro_len_min,
-                countdown_seconds,
-                hb_voice_delay_seconds + hb_voice_dur
-            )
-        else:
-            intro_len = 0.0
-
-        # End HB voice rules
-        end_hb_voice_enabled = bool(intro_enabled and hb_voice_available and add_hb_voice_to_song_end)
-        hb_vol_intro = float(intro_cfg.get("hb_voice_volume", 1.0))
-        hb_vol_song_end = float(intro_cfg.get("song_end_hb_voice_volume", hb_vol_intro))
-
-        # Trim config (optional)
-        trim_cfg = audio_cfg.get("trim_silence", {}) or {}
-        trim_enabled = bool(trim_cfg.get("enabled", False))
-        threshold_db = float(trim_cfg.get("threshold_db", -45))
-        min_silence = float(trim_cfg.get("min_silence_seconds", 0.08))
-        max_leading_trim = float(trim_cfg.get("max_leading_trim_seconds", 2.0))
-        end_silence = float(trim_cfg.get("end_silence_seconds", 0.20))
-        subtitle_nudge = float(trim_cfg.get("subtitle_nudge_seconds", 0.0))  # optional fine-tune
-
-        lead_trim = 0.0
-        if trim_enabled:
-            lead_trim = detect_leading_silence_seconds(
-                TMP_MUSIC,
-                threshold_db=threshold_db,
-                min_silence=min_silence,
-                max_trim=max_leading_trim,
-            )
-
-        # Karaoke ASS shift:
-        # - intro adds intro_len delay
-        # - trimming removes lead_trim delay
-        effective_ass_shift = ((intro_len - lead_trim) if intro_enabled else (-lead_trim)) + subtitle_nudge
-
-        ass_path_for_render = TMP_ASS
-        if abs(effective_ass_shift) > 1e-6:
-            shift_ass_dialogue_times(TMP_ASS, TMP_SHIFTED_ASS, effective_ass_shift)
-            ass_path_for_render = TMP_SHIFTED_ASS
-
-        # Timings based on final ASS
-        # ass_end = absolute "last sung word ended" in the final output timeline
-        ass_end = get_ass_end_seconds(ass_path_for_render)
-        ass_start = get_ass_start_seconds(ass_path_for_render)
-
-        music_dur = get_media_duration_seconds(TMP_MUSIC)
-        effective_song_dur = max(0.0, music_dur - lead_trim)
-
-        # Base audio ends here, before any added end HB voice
-        base_audio_end_est = (intro_len if intro_enabled else 0.0) + effective_song_dur
-
-        # NEW: end HB voice starts exactly when singing ends (ASS last end),
-        # optionally plus a tiny user-defined delay.
-        song_end_hb_start = max(0.0, ass_end + song_end_hb_voice_delay_seconds) if end_hb_voice_enabled else None
-        song_end_hb_end = (song_end_hb_start + hb_voice_dur) if (end_hb_voice_enabled and song_end_hb_start is not None) else None
-
-        pad = float(render.get("end_pad_seconds", 0.3))
-        total_audio_len_est = max(
-            base_audio_end_est,
-            (song_end_hb_end or 0.0)
-        )
-        duration_cap = max(ass_end, total_audio_len_est) + pad if (ass_end > 0 or total_audio_len_est > 0) else None
