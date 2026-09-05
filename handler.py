@@ -694,7 +694,10 @@ def _safe_job_component(value) -> str:
 
 def _escape_ass_text(value: str) -> str:
     """Escape user text while retaining explicit newlines as ASS line breaks."""
-    value = str(value).replace("\\", r"\\")
+    # Direct API callers may send literal JSON-style \\n/\\N sequences.
+    # Normalize those before escaping normal ASS backslashes.
+    value = str(value).replace(r"\N", "\n").replace(r"\n", "\n")
+    value = value.replace("\\", r"\\")
     value = value.replace("{", r"\{").replace("}", r"\}")
     return value.replace("\r\n", r"\N").replace("\n", r"\N").replace("\r", r"\N")
 
@@ -769,6 +772,100 @@ def _resolve_auto_palette_text_events(events: list, palette: list[dict]) -> list
     return resolved
 
 
+def _ass_phrase_start_times(path: str, phrase: str) -> list[float]:
+    """Return karaoke-timed start positions for an exact phrase in an ASS file.
+
+    Theme renders deliberately do not show the karaoke captions themselves.
+    This reads their timing data only, so celebratory title cards can arrive
+    exactly with the sung words (for example each “Happy Birthday”).
+    """
+    wanted = re.findall(r"[A-Z0-9]+", str(phrase).upper())
+    if not wanted:
+        return []
+
+    matches: list[float] = []
+    karaoke_re = re.compile(r"\{\\[kK](\d+)\}([^\{]*)")
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+            lines = list(handle)
+    except OSError:
+        return matches
+
+    for line in lines:
+        if not line.startswith("Dialogue:"):
+            continue
+        fields = line.rstrip("\r\n").split(",", 9)
+        if len(fields) != 10:
+            continue
+        try:
+            dialogue_start = ass_time_to_seconds(fields[1].strip())
+        except Exception:
+            continue
+
+        words: list[tuple[str, float]] = []
+        cursor = dialogue_start
+        for karaoke in karaoke_re.finditer(fields[9].replace(r"\N", " ")):
+            duration = max(0.0, int(karaoke.group(1)) / 100.0)
+            chunk_words = re.findall(r"[A-Z0-9]+", karaoke.group(2).upper())
+            if chunk_words:
+                # A karaoke chunk is normally a single word. Split evenly if
+                # an upstream ASS writer placed more than one in one chunk.
+                step = duration / len(chunk_words)
+                words.extend((word, cursor + index * step) for index, word in enumerate(chunk_words))
+            cursor += duration
+
+        for index in range(0, len(words) - len(wanted) + 1):
+            if [word for word, _ in words[index:index + len(wanted)]] == wanted:
+                matches.append(words[index][1])
+    return matches
+
+
+def _expand_ass_synced_text_events(templates: list, timing_ass_path: str | None) -> tuple[list[dict], int]:
+    """Expand reusable text-card templates at matching karaoke phrase times."""
+    if not timing_ass_path or not isinstance(templates, list):
+        return [], 0
+
+    expanded: list[dict] = []
+    for raw in templates:
+        if not isinstance(raw, dict):
+            continue
+        phrase = str(raw.get("match", "")).strip()
+        starts = _ass_phrase_start_times(timing_ass_path, phrase)
+        occurrence = raw.get("occurrence", "all")
+        if occurrence != "all":
+            try:
+                starts = [starts[int(occurrence)]]
+            except (TypeError, ValueError, IndexError):
+                starts = []
+        max_occurrences = int(raw.get("max_occurrences", 0) or 0)
+        if max_occurrences > 0:
+            starts = starts[:max_occurrences]
+
+        for occurrence_index, start_s in enumerate(starts):
+            event = {
+                key: value for key, value in raw.items()
+                if key not in {"match", "occurrence", "max_occurrences", "duration_seconds", "animations", "positions"}
+            }
+            duration = max(0.35, float(raw.get("duration_seconds", 1.65)))
+            event["start_seconds"] = start_s
+            event["end_seconds"] = start_s + duration
+            animations = raw.get("animations")
+            if isinstance(animations, list) and animations:
+                event["animation"] = animations[occurrence_index % len(animations)]
+            positions = raw.get("positions")
+            if isinstance(positions, list) and positions:
+                position = positions[occurrence_index % len(positions)]
+                if isinstance(position, dict):
+                    event.update({key: value for key, value in position.items() if key in {"x", "y", "alignment"}})
+            if "palette_index" in event:
+                try:
+                    event["palette_index"] = int(event["palette_index"]) + occurrence_index
+                except (TypeError, ValueError):
+                    pass
+            expanded.append(event)
+    return expanded, len(expanded)
+
+
 def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
     """Build one ASS document containing independently timed theme text events."""
     if not isinstance(events, list):
@@ -832,10 +929,33 @@ def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
                 f"\\t({stamp_ms},{settle_ms},\\fscx100\\fscy100)",
             ])
         elif animation == "pulse":
-            midpoint = max(100, duration_ms // 2)
+            beat = min(420, max(130, duration_ms // 7))
+            second = max(beat * 3, duration_ms // 2)
             tags.extend([
-                f"\\t(0,{midpoint},\\fscx108\\fscy108)",
-                f"\\t({midpoint},{duration_ms},\\fscx100\\fscy100)",
+                f"\\t(0,{beat},\\fscx108\\fscy108)",
+                f"\\t({beat},{beat * 2},\\fscx100\\fscy100)",
+                f"\\t({second},{min(duration_ms, second + beat)},\\fscx106\\fscy106)",
+                f"\\t({min(duration_ms, second + beat)},{min(duration_ms, second + beat * 2)},\\fscx100\\fscy100)",
+            ])
+        elif animation == "bounce":
+            beat = min(360, max(130, duration_ms // 7))
+            start_y = y + max(45, int(raw.get("motion_distance", 170)) // 2)
+            tags.extend([
+                "\\fscx88\\fscy88",
+                f"\\move({x},{start_y},{x},{y},0,{beat})",
+                f"\\t(0,{beat},\\fscx114\\fscy114)",
+                f"\\t({beat},{beat * 2},\\fscx100\\fscy100)",
+                f"\\t({max(beat * 3, duration_ms // 2)},{min(duration_ms, max(beat * 3, duration_ms // 2) + beat)},\\fscx106\\fscy106)",
+            ])
+        elif animation == "wiggle":
+            beat = min(280, max(110, duration_ms // 8))
+            middle = max(beat * 3, duration_ms // 2)
+            tags.extend([
+                "\\frz-5\\fscx94\\fscy94",
+                f"\\t(0,{beat},\\frz5\\fscx108\\fscy108)",
+                f"\\t({beat},{beat * 2},\\frz-2\\fscx100\\fscy100)",
+                f"\\t({middle},{min(duration_ms, middle + beat)},\\frz3\\fscx105\\fscy105)",
+                f"\\t({min(duration_ms, middle + beat)},{min(duration_ms, middle + beat * 2)},\\frz0\\fscx100\\fscy100)",
             ])
         elif animation in {"slide_up", "slide_down", "slide_left", "slide_right"}:
             # Animate into the final position, then keep it there until the fade.
@@ -964,6 +1084,7 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
     out_path = os.path.join(job_dir, "final.mp4")
     text_ass_path = os.path.join(job_dir, "text-events.ass")
     supplied_ass_path = os.path.join(job_dir, "overlay.ass")
+    timing_ass_path = os.path.join(job_dir, "timing.ass")
     intro_bgm_path = os.path.join(job_dir, "intro-bgm.mp3")
     image_paths = []
 
@@ -976,6 +1097,9 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
             download_from_r2(key, local_path)
             image_paths.append(local_path)
         download_from_r2(music_key, music_path)
+        timing_ass_key = inp.get("timing_ass_key")
+        if timing_ass_key:
+            download_from_r2(timing_ass_key, timing_ass_path)
         text_palette = [
             _choose_text_palette_color(path, index)
             for index, path in enumerate(image_paths)
@@ -1099,8 +1223,13 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
                 supplied_filter += f":fontsdir={fontsdir}"
             video_filter_tail.append(supplied_filter)
 
+        synced_text_events, synced_text_event_count = _expand_ass_synced_text_events(
+            render.get("ass_synced_text_events", []) or [],
+            timing_ass_path if timing_ass_key else None,
+        )
         text_events = _resolve_auto_palette_text_events(
-            render.get("text_events", []) or [], text_palette,
+            (render.get("text_events", []) or []) + synced_text_events,
+            text_palette,
         )
         generated_ass = _make_text_events_ass(text_events, play_w, play_h)
         if generated_ass:
@@ -1194,6 +1323,8 @@ def _render_slideshow(*, inp: dict, render: dict, job_id, fontsdir: str, play_w:
             "measured_audio_duration_seconds": measured_music_duration,
             "intro_seconds": intro_seconds, "total_duration_seconds": total_duration,
             "overlay_ass_used": bool(supplied_ass_key),
+            "timing_ass_used": bool(timing_ass_key),
+            "ass_synced_text_event_count": synced_text_event_count,
             "generated_text_events_used": bool(generated_ass),
             "audio_validation": audio_check, "ffmpeg_cmd": cmd,
             "filter_complex": filter_complex, "ffmpeg_stderr_tail": process.stderr[-20000:],
@@ -1448,3 +1579,497 @@ def handler(event):
 
         loop_video = bool(timing_cfg.get("loop_video", False))
 
+        video_cfg = render.get("video", {}) or {}
+        audio_cfg = render.get("audio", {}) or {}
+
+        v_codec = video_cfg.get("codec", "libx264")
+        v_preset = video_cfg.get("preset", "medium")
+        v_crf = str(video_cfg.get("crf", 18))
+        v_pix_fmt = video_cfg.get("pix_fmt", "yuv420p")
+        v_profile = video_cfg.get("profile", "high")
+        v_tune = video_cfg.get("tune", None)
+        v_scale = video_cfg.get("scale", None)
+        faststart = bool(video_cfg.get("movflags_faststart", True))
+
+        a_codec = audio_cfg.get("codec", "aac")
+        a_bitrate = audio_cfg.get("bitrate", "192k")
+        a_volume = audio_cfg.get("volume", None)
+
+        # Download base assets
+        download_from_r2(video_key, TMP_IN)
+        download_from_r2(ass_key, TMP_ASS)
+        download_from_r2(music_key, TMP_MUSIC)
+
+        hb_voice_dur = 0.0
+        intro_len = 0.0
+        hb_voice_available = False
+
+        # Intro assets (and compute dynamic intro length)
+        if intro_enabled:
+            missing = [k for k in ["bgm_key", "countdown_key", "hb_voice_key"] if not intro_cfg.get(k)]
+            if missing:
+                return {"error": "intro.enabled is true but missing intro keys", "missing": missing}
+
+            download_from_r2(intro_cfg["bgm_key"], TMP_INTRO_BGM)
+            download_from_r2(intro_cfg["countdown_key"], TMP_COUNTDOWN_VO)
+            download_from_r2(intro_cfg["hb_voice_key"], TMP_HB_VO)
+
+            hb_voice_dur = max(0.0, get_media_duration_seconds(TMP_HB_VO))
+            hb_voice_available = hb_voice_dur > 0.0
+
+            # Dynamic intro length: minimum vs spoken audio length
+            intro_len = max(
+                intro_len_min,
+                countdown_seconds,
+                hb_voice_delay_seconds + hb_voice_dur
+            )
+        else:
+            intro_len = 0.0
+
+        # End HB voice rules
+        end_hb_voice_enabled = bool(intro_enabled and hb_voice_available and add_hb_voice_to_song_end)
+        hb_vol_intro = float(intro_cfg.get("hb_voice_volume", 1.0))
+        hb_vol_song_end = float(intro_cfg.get("song_end_hb_voice_volume", hb_vol_intro))
+
+        # Trim config (optional)
+        trim_cfg = audio_cfg.get("trim_silence", {}) or {}
+        trim_enabled = bool(trim_cfg.get("enabled", False))
+        threshold_db = float(trim_cfg.get("threshold_db", -45))
+        min_silence = float(trim_cfg.get("min_silence_seconds", 0.08))
+        max_leading_trim = float(trim_cfg.get("max_leading_trim_seconds", 2.0))
+        end_silence = float(trim_cfg.get("end_silence_seconds", 0.20))
+        subtitle_nudge = float(trim_cfg.get("subtitle_nudge_seconds", 0.0))  # optional fine-tune
+
+        lead_trim = 0.0
+        if trim_enabled:
+            lead_trim = detect_leading_silence_seconds(
+                TMP_MUSIC,
+                threshold_db=threshold_db,
+                min_silence=min_silence,
+                max_trim=max_leading_trim,
+            )
+
+        # Karaoke ASS shift:
+        # - intro adds intro_len delay
+        # - trimming removes lead_trim delay
+        effective_ass_shift = ((intro_len - lead_trim) if intro_enabled else (-lead_trim)) + subtitle_nudge
+
+        ass_path_for_render = TMP_ASS
+        if abs(effective_ass_shift) > 1e-6:
+            shift_ass_dialogue_times(TMP_ASS, TMP_SHIFTED_ASS, effective_ass_shift)
+            ass_path_for_render = TMP_SHIFTED_ASS
+
+        # Timings based on final ASS
+        # ass_end = absolute "last sung word ended" in the final output timeline
+        ass_end = get_ass_end_seconds(ass_path_for_render)
+        ass_start = get_ass_start_seconds(ass_path_for_render)
+
+        music_dur = get_media_duration_seconds(TMP_MUSIC)
+        effective_song_dur = max(0.0, music_dur - lead_trim)
+
+        # Base audio ends here, before any added end HB voice
+        base_audio_end_est = (intro_len if intro_enabled else 0.0) + effective_song_dur
+
+        # NEW: end HB voice starts exactly when singing ends (ASS last end),
+        # optionally plus a tiny user-defined delay.
+        song_end_hb_start = max(0.0, ass_end + song_end_hb_voice_delay_seconds) if end_hb_voice_enabled else None
+        song_end_hb_end = (song_end_hb_start + hb_voice_dur) if (end_hb_voice_enabled and song_end_hb_start is not None) else None
+
+        pad = float(render.get("end_pad_seconds", 0.3))
+        total_audio_len_est = max(
+            base_audio_end_est,
+            (song_end_hb_end or 0.0)
+        )
+        duration_cap = max(ass_end, total_audio_len_est) + pad if (ass_end > 0 or total_audio_len_est > 0) else None
+
+        # -----------------------------
+        # Build video filter chain (ALL with fontsdir)
+        # -----------------------------
+        vf_filters = []
+        if v_scale:
+            vf_filters.append(f"scale={v_scale}")
+
+        # Main karaoke subtitles
+        subs_filter = f"subtitles={ass_path_for_render}"
+        if fontsdir:
+            subs_filter += f":fontsdir={fontsdir}"
+        force_style = subs_cfg.get("force_style", None)
+        if isinstance(force_style, dict) and force_style:
+            fs = _build_force_style(force_style)
+            subs_filter += f":force_style='{_escape_for_subtitles_filter(fs)}'"
+        vf_filters.append(subs_filter)
+
+        # Countdown overlay during intro
+        if intro_enabled:
+            countdown_ass = _make_countdown_overlay_ass(countdown_cfg, play_w, play_h)
+            with open(TMP_COUNTDOWN_ASS, "w", encoding="utf-8") as f:
+                f.write(countdown_ass)
+
+            cd_filter = f"subtitles={TMP_COUNTDOWN_ASS}"
+            if fontsdir:
+                cd_filter += f":fontsdir={fontsdir}"
+            vf_filters.append(cd_filter)
+
+        # HAPPY BIRTHDAY overlay (shift to normal_text_start)
+        happy_birthday_used = False
+        if hb_cfg is True:
+            hb_cfg = {}
+        if isinstance(hb_cfg, dict):
+            hb_text = str(hb_cfg.get("text", "")).strip()
+            if hb_text:
+                hb_full_cfg = dict(hb_cfg)
+                hb_full_cfg.setdefault("text", hb_text)
+                hb_full_cfg.setdefault("animation", "static")
+                hb_full_cfg.setdefault("font", "Montserrat SemiBold")
+                hb_full_cfg.setdefault("size", 220)
+                hb_full_cfg.setdefault("x", play_w // 2)
+                hb_full_cfg.setdefault("y", int(play_h * 0.38))
+                hb_full_cfg.setdefault("alignment", 5)
+                hb_full_cfg.setdefault("color", "&H00FFFFFF&")
+                hb_full_cfg.setdefault("outline", 10)
+                hb_full_cfg.setdefault("outline_color", "&H00000000&")
+                hb_full_cfg.setdefault("shadow", 0)
+
+                hb_ass = _make_name_overlay_ass(hb_full_cfg, play_w, play_h)
+                with open(TMP_HB_ASS, "w", encoding="utf-8") as f:
+                    f.write(hb_ass)
+
+                if normal_text_start > 0:
+                    shift_ass_dialogue_times(TMP_HB_ASS, TMP_HB_ASS, normal_text_start)
+
+                hb_filter = f"subtitles={TMP_HB_ASS}"
+                if fontsdir:
+                    hb_filter += f":fontsdir={fontsdir}"
+                vf_filters.append(hb_filter)
+                happy_birthday_used = True
+
+        # Name overlay (shift to normal_text_start)
+        name_overlay_used = False
+        if isinstance(name_cfg, dict) and str(name_cfg.get("text", "")).strip():
+            name_ass = _make_name_overlay_ass(name_cfg, play_w, play_h)
+            with open(TMP_NAME_ASS, "w", encoding="utf-8") as f:
+                f.write(name_ass)
+
+            if normal_text_start > 0:
+                shift_ass_dialogue_times(TMP_NAME_ASS, TMP_NAME_ASS, normal_text_start)
+
+            name_filter = f"subtitles={TMP_NAME_ASS}"
+            if fontsdir:
+                name_filter += f":fontsdir={fontsdir}"
+            vf_filters.append(name_filter)
+            name_overlay_used = True
+
+        # BEFORE overlay: start at normal_text_start, end at ass_start
+        before_subtitles_used = False
+        before_subtitles_window = None
+        if before_cfg is True:
+            before_cfg = {}
+        if isinstance(before_cfg, dict) and bool(before_cfg.get("enabled", True)):
+            min_seconds = float(before_cfg.get("min_seconds", 0.1))
+            start_before = max(0.0, float(normal_text_start))
+            end_before = max(start_before, float(ass_start))
+            if (end_before - start_before) >= min_seconds:
+                before_ass = _make_timed_static_overlay_ass(before_cfg, play_w, play_h, start_before, end_before)
+                with open(TMP_BEFORE_ASS, "w", encoding="utf-8") as f:
+                    f.write(before_ass)
+
+                bf_filter = f"subtitles={TMP_BEFORE_ASS}"
+                if fontsdir:
+                    bf_filter += f":fontsdir={fontsdir}"
+                vf_filters.append(bf_filter)
+
+                before_subtitles_used = True
+                before_subtitles_window = {"start": start_before, "end": end_before, "min_seconds": min_seconds}
+
+        # AFTER overlay: start at ass_end, end at duration_cap
+        after_subtitles_used = False
+        after_subtitles_window = None
+        if after_cfg is True:
+            after_cfg = {}
+        if isinstance(after_cfg, dict) and bool(after_cfg.get("enabled", True)) and duration_cap is not None:
+            min_seconds = float(after_cfg.get("min_seconds", 2.0))
+            start_after = max(0.0, float(ass_end))
+            end_after = float(duration_cap)
+            if (end_after - start_after) >= min_seconds:
+                after_ass = _make_timed_static_overlay_ass(after_cfg, play_w, play_h, start_after, end_after)
+                with open(TMP_AFTER_ASS, "w", encoding="utf-8") as f:
+                    f.write(after_ass)
+
+                af_filter = f"subtitles={TMP_AFTER_ASS}"
+                if fontsdir:
+                    af_filter += f":fontsdir={fontsdir}"
+                vf_filters.append(af_filter)
+
+                after_subtitles_used = True
+                after_subtitles_window = {"start": start_after, "end": end_after, "min_seconds": min_seconds}
+
+        vf = ",".join(vf_filters)
+
+        # -----------------------------
+        # FILTER_COMPLEX: video + audio
+        # -----------------------------
+        fc = []
+        fc.append(f"[0:v]{vf}[vout]")
+
+        # IMPORTANT: To keep subtitles perfect, we ONLY trim start with atrim(lead_trim),
+        # and only trim end with silenceremove stop_periods.
+        def build_song_chain(in_label: str, out_label: str) -> str:
+            parts = []
+
+            # END-only silence trim (does NOT touch the beginning)
+            if trim_enabled:
+                parts.append(
+                    "silenceremove="
+                    f"stop_periods=1:stop_duration={end_silence}:stop_threshold={threshold_db}dB"
+                )
+
+            # START trim exactly once, using detected lead_trim
+            if trim_enabled and lead_trim > 0.0:
+                parts.append(f"atrim=start={lead_trim:.3f}")
+                parts.append("asetpts=PTS-STARTPTS")
+
+            if a_volume is not None:
+                parts.append(f"volume={float(a_volume)}")
+
+            parts.append("aresample=async=1")
+            return f"{in_label}{','.join(parts)}{out_label}"
+
+        if not intro_enabled:
+            # No intro, just song
+            fc.append(build_song_chain("[1:a]", "[basea]"))
+            current_audio_label = "[basea]"
+        else:
+            intro_bgm_vol = float(intro_cfg.get("bgm_volume", 1.0))
+            cd_vol = float(intro_cfg.get("countdown_volume", 1.0))
+
+            if end_hb_voice_enabled:
+                fc.append("[4:a]asplit=2[hbvo_src_intro][hbvo_src_end]")
+                hb_intro_src = "[hbvo_src_intro]"
+                hb_end_src = "[hbvo_src_end]"
+            else:
+                hb_intro_src = "[4:a]"
+                hb_end_src = None
+
+            # Intro components
+            fc.append(f"[2:a]volume={intro_bgm_vol},atrim=0:{intro_len:.3f},asetpts=PTS-STARTPTS[introb]")
+            fc.append(f"[3:a]volume={cd_vol},atrim=0:{countdown_seconds:.3f},asetpts=PTS-STARTPTS[countvo]")
+
+            delay_ms = int(round(hb_voice_delay_seconds * 1000))
+            fc.append(
+                f"{hb_intro_src}volume={hb_vol_intro},atrim=0:{hb_voice_dur:.3f},"
+                f"asetpts=PTS-STARTPTS,adelay={delay_ms}|{delay_ms}[hbvo_intro]"
+            )
+
+            fc.append("[introb][countvo][hbvo_intro]amix=inputs=3:normalize=0:duration=longest[intromix]")
+            fc.append(f"[intromix]atrim=0:{intro_len:.3f},asetpts=PTS-STARTPTS[intro]")
+
+            # Song
+            fc.append(build_song_chain("[1:a]", "[song]"))
+
+            # Base audio = intro + song
+            fc.append("[intro][song]concat=n=2:v=0:a=1[basea]")
+            current_audio_label = "[basea]"
+
+        # NEW: add same HB voice at song end
+        # Starts exactly at the last sung word end time (ass_end), even if music continues or not.
+        song_end_hb_added = False
+        if end_hb_voice_enabled and song_end_hb_start is not None and hb_voice_dur > 0.0:
+            end_delay_ms = int(round(song_end_hb_start * 1000))
+
+            if intro_enabled and hb_end_src is not None:
+                fc.append(
+                    f"{hb_end_src}volume={hb_vol_song_end},atrim=0:{hb_voice_dur:.3f},"
+                    f"asetpts=PTS-STARTPTS,adelay={end_delay_ms}|{end_delay_ms}[hbvo_end]"
+                )
+            else:
+                # Fallback path; should normally not happen because end_hb_voice_enabled requires intro_enabled
+                fc.append(
+                    f"[4:a]volume={hb_vol_song_end},atrim=0:{hb_voice_dur:.3f},"
+                    f"asetpts=PTS-STARTPTS,adelay={end_delay_ms}|{end_delay_ms}[hbvo_end]"
+                )
+
+            fc.append(f"{current_audio_label}[hbvo_end]amix=inputs=2:normalize=0:duration=longest[aout]")
+            song_end_hb_added = True
+        else:
+            fc.append(f"{current_audio_label}anull[aout]")
+
+        filter_complex = ";".join(fc)
+
+        # -----------------------------
+        # ffmpeg command
+        # -----------------------------
+        cmd = ["ffmpeg", "-y"]
+
+        # video (loop starts immediately)
+        if loop_video:
+            cmd += ["-stream_loop", "-1", "-i", TMP_IN]
+        else:
+            cmd += ["-i", TMP_IN]
+
+        # audio inputs
+        cmd += ["-i", TMP_MUSIC]
+        if intro_enabled:
+            cmd += ["-i", TMP_INTRO_BGM, "-i", TMP_COUNTDOWN_VO, "-i", TMP_HB_VO]
+
+        cmd += [
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-c:v", str(v_codec),
+            "-preset", str(v_preset),
+            "-crf", str(v_crf),
+            "-pix_fmt", str(v_pix_fmt),
+            "-c:a", str(a_codec),
+            "-b:a", str(a_bitrate),
+            "-shortest",
+        ]
+
+        if v_profile:
+            cmd += ["-profile:v", str(v_profile)]
+        if v_tune:
+            cmd += ["-tune", str(v_tune)]
+        if faststart:
+            cmd += ["-movflags", "+faststart"]
+
+        if duration_cap is not None:
+            cmd += ["-t", f"{duration_cap:.3f}"]
+
+        cmd.append(TMP_OUT)
+
+        last_render_error = None
+        last_audio_check = None
+        p = None
+
+        for render_attempt in range(2):
+            p = subprocess.run(cmd, capture_output=True, text=True)
+
+            if p.returncode != 0:
+                last_render_error = {
+                    "error": "ffmpeg failed",
+                    "returncode": p.returncode,
+                    "stderr": p.stderr[-20000:],
+                    "stdout": p.stdout[-20000:],
+                    "cmd": cmd,
+                    "filter_complex": filter_complex,
+                    "render_attempt": render_attempt + 1,
+                }
+                continue
+
+            audio_windows = [
+                (2.0, 8.0),
+                (16.0, 22.0),
+                (26.0, 32.0),
+            ]
+
+            audio_ok = True
+            audio_checks = []
+
+            for start_offset, end_offset in audio_windows:
+                start_s = (intro_len + start_offset) if intro_enabled else start_offset
+                duration = end_offset - start_offset
+
+                ok, audio_check = validate_output_audio_after_intro(
+                    TMP_OUT,
+                    start_s=start_s,
+                    check_duration_s=duration,
+                    silence_threshold_db=float(audio_cfg.get("post_audio_silence_threshold_db", -55.0)),
+                )
+
+                audio_checks.append({
+                    "window_relative_to_song": [start_offset, end_offset],
+                    "checked_from_seconds": start_s,
+                    "checked_duration_seconds": duration,
+                    "ok": ok,
+                    "result": audio_check,
+                })
+
+                if not ok:
+                    audio_ok = False
+
+            last_audio_check = {
+                "all_windows_ok": audio_ok,
+                "windows": audio_checks,
+            }
+
+            if audio_ok:
+                break
+
+            last_render_error = {
+                "error": "output audio validation failed",
+                "audio_check": last_audio_check,
+                "cmd": cmd,
+                "filter_complex": filter_complex,
+                "ffmpeg_stderr_tail": p.stderr[-20000:],
+                "render_attempt": render_attempt + 1,
+            }
+        else:
+            return {
+                **(last_render_error or {"error": "render failed"}),
+                "retried": True,
+                "max_attempts": 2,
+            }
+
+        uploaded = upload_to_r2(TMP_OUT, out_key)
+
+        # Thumbnail (optional)
+        thumb_result = None
+        thumb_cmd = None
+        try:
+            thumb_result, thumb_cmd = _render_thumbnail(
+                thumb_cfg=thumb_cfg,
+                job_id=job_id,
+                name_cfg=name_cfg,
+                fontsdir=fontsdir,
+            )
+        except ValueError as ve:
+            if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
+                return {"error": str(ve)}
+        except RuntimeError as re_err:
+            if isinstance(thumb_cfg, dict) and bool(thumb_cfg.get("enabled", False)):
+                return {"error": "thumbnail ffmpeg failed", "details": str(re_err)}
+
+        return {
+            "status": "ok",
+            "mode": "render",
+            "jobId": job_id,
+            "out_key": out_key,
+            "uploaded": uploaded,
+            "thumbnail_uploaded": thumb_result,
+            "thumbnail_ffmpeg_cmd": thumb_cmd,
+            "fontsdir_used": fontsdir,
+            "intro_enabled": intro_enabled,
+            "intro_seconds_min": intro_len_min if intro_enabled else 0.0,
+            "intro_seconds_effective": intro_len if intro_enabled else 0.0,
+            "hb_voice_seconds": hb_voice_dur if intro_enabled else 0.0,
+            "hb_voice_delay_seconds": hb_voice_delay_seconds if intro_enabled else 0.0,
+            "countdown_seconds": countdown_seconds if intro_enabled else 0.0,
+            "normal_text_start_seconds": normal_text_start,
+            "trim_enabled": trim_enabled,
+            "trimmed_leading_seconds": lead_trim,
+            "subtitle_nudge_seconds": subtitle_nudge,
+            "effective_ass_shift_seconds": effective_ass_shift,
+            "happy_birthday_used": happy_birthday_used,
+            "name_overlay_used": name_overlay_used,
+            "before_subtitles_used": before_subtitles_used,
+            "after_subtitles_used": after_subtitles_used,
+            "before_subtitles_window": before_subtitles_window,
+            "after_subtitles_window": after_subtitles_window,
+            "song_end_hb_voice_enabled": end_hb_voice_enabled,
+            "song_end_hb_voice_added": song_end_hb_added,
+            "song_end_hb_voice_start_seconds": song_end_hb_start,
+            "song_end_hb_voice_end_seconds": song_end_hb_end,
+            "base_audio_end_est_seconds": base_audio_end_est,
+            "duration_cap_seconds": duration_cap,
+            "audio_validation": last_audio_check,
+            "render_attempts_used": render_attempt + 1,
+            "audio_validation_retried": render_attempt > 0,
+            "ffmpeg_cmd": cmd,
+            "filter_complex": filter_complex,
+            "ffmpeg_stderr_tail": p.stderr[-20000:],
+        }
+
+    except Exception as e:
+        return {"error": "handler exception", "details": str(e)}
+
+
+runpod.serverless.start({"handler": handler})
