@@ -703,10 +703,11 @@ def _escape_ass_text(value: str) -> str:
 
 
 def _choose_text_palette_color(image_path: str, fallback_index: int) -> dict:
-    """Derive a darker vivid text color from a still's dominant hue.
+    """Derive a vivid, darker complementary text color from a still's hue.
 
-    White outlining and a dark shadow provide contrast even for busy party
-    artwork, so the foreground can stay connected to its visual palette.
+    The 180-degree hue shift makes the foreground pop against the sampled
+    artwork. White outlining and a dark shadow retain legibility on busy
+    party imagery.
     """
     fallback_hue = (0.57 + fallback_index * 0.17) % 1.0
     try:
@@ -735,13 +736,15 @@ def _choose_text_palette_color(image_path: str, fallback_index: int) -> dict:
     except Exception:
         hue = fallback_hue
 
-    # High saturation preserves the festive quality; 72% value keeps it darker
-    # than a neon foreground and lets the white edge do its job.
-    r, g, b = colorsys.hsv_to_rgb(hue, 0.90, 0.72)
+    complementary_hue = (hue + 0.5) % 1.0
+    # High saturation preserves the festive quality; 70% value keeps it
+    # deliberately richer than a neon foreground while the white edge carries
+    # through on complex full-frame party art.
+    r, g, b = colorsys.hsv_to_rgb(complementary_hue, 0.90, 0.70)
     red, green, blue = (int(round(channel * 255)) for channel in (r, g, b))
 
     return {
-        "name": f"sampled_hue_{int(round(hue * 360)) % 360}",
+        "name": f"complementary_hue_{int(round(complementary_hue * 360)) % 360}",
         "ass_color": f"&H00{blue:02X}{green:02X}{red:02X}&",
         "outline_color": "&H00FFFFFF&",
         "shadow_color": "&H00000000&",
