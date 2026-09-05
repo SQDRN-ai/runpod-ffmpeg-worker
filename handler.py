@@ -1040,8 +1040,13 @@ def _render_thumbnail(*, thumb_cfg: dict, job_id, name_cfg, fontsdir: str):
         )
 
         size_cfg = thumb_cfg.get("size", {}) or {}
-        tw = int(size_cfg.get("width", 1920))
-        th = int(size_cfg.get("height", 1080))
+        # Render 16:9 thumbnails at 4K by default. YouTube's upload endpoint
+        # imposes a 2 MB file limit, so the encoder below validates the final
+        # JPEG and gracefully steps down in quality/resolution when necessary.
+        tw = int(size_cfg.get("width", 3840))
+        th = int(size_cfg.get("height", 2160))
+        if tw < 2 or th < 2:
+            raise ValueError("thumbnail.size.width and thumbnail.size.height must be at least 2")
 
         name_text_cfg = thumb_cfg.get("name_text", {}) or {}
         thumb_text = str(
@@ -1074,8 +1079,6 @@ def _render_thumbnail(*, thumb_cfg: dict, job_id, name_cfg, fontsdir: str):
 
         safe_text = _escape_drawtext_text(thumb_text)
 
-        scale_crop = f"scale={tw}:{th}:force_original_aspect_ratio=increase,crop={tw}:{th}"
-
         drawtext_parts = []
         if resolved_fontfile:
             drawtext_parts.append(f"fontfile='{resolved_fontfile}'")
@@ -1096,28 +1099,80 @@ def _render_thumbnail(*, thumb_cfg: dict, job_id, name_cfg, fontsdir: str):
             f"shadowcolor={shadowcolor}",
         ]
 
-        vf_thumb = f"{scale_crop},drawtext=" + ":".join(drawtext_parts)
+        # Keep a small margin below YouTube's 2,000,000-byte limit. First
+        # preserve 4K and trade a little JPEG quality; only then fall back to
+        # still-high resolutions. Callers can override every value per theme.
+        max_bytes = int(thumb_cfg.get("max_bytes", 1_950_000))
+        if max_bytes < 1:
+            raise ValueError("thumbnail.max_bytes must be positive")
+        initial_quality = max(2, min(31, int(thumb_cfg.get("jpg_quality", 2))))
+        quality_candidates = []
+        for quality in (initial_quality, initial_quality + 1, initial_quality + 2,
+                        initial_quality + 4, initial_quality + 6, initial_quality + 8,
+                        initial_quality + 10):
+            quality = min(31, quality)
+            if quality not in quality_candidates:
+                quality_candidates.append(quality)
 
-        thumb_cmd = [
-            "ffmpeg", "-y",
-            "-i", TMP_THUMB_BG,
-            "-vf", vf_thumb,
-            "-frames:v", "1",
-            "-q:v", str(int(thumb_cfg.get("jpg_quality", 2))),
-            TMP_THUMB_OUT
-        ]
+        requested_widths = [tw, 3200, 2560, 2048, 1920]
+        width_candidates = []
+        for width in requested_widths:
+            if 2 <= width <= tw and width not in width_candidates:
+                width_candidates.append(width)
 
-        tp = subprocess.run(thumb_cmd, capture_output=True, text=True)
-        if tp.returncode != 0:
+        selected = None
+        attempts = []
+        for width in width_candidates:
+            height = max(2, int(round(th * (width / tw))) // 2 * 2)
+            scale_crop = (
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height}"
+            )
+            vf_thumb = f"{scale_crop},drawtext=" + ":".join(drawtext_parts)
+            for quality in quality_candidates:
+                thumb_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", TMP_THUMB_BG,
+                    "-vf", vf_thumb,
+                    "-frames:v", "1",
+                    "-c:v", "mjpeg",
+                    "-q:v", str(quality),
+                    TMP_THUMB_OUT,
+                ]
+                tp = subprocess.run(thumb_cmd, capture_output=True, text=True)
+                if tp.returncode != 0:
+                    raise RuntimeError(
+                        "thumbnail ffmpeg failed\n"
+                        f"returncode={tp.returncode}\n"
+                        f"stderr_tail={tp.stderr[-20000:]}\n"
+                        f"stdout_tail={tp.stdout[-20000:]}\n"
+                        f"cmd={thumb_cmd}"
+                    )
+                size_bytes = os.path.getsize(TMP_THUMB_OUT)
+                attempts.append({"width": width, "height": height, "jpg_quality": quality, "size_bytes": size_bytes})
+                if size_bytes <= max_bytes:
+                    selected = attempts[-1]
+                    break
+            if selected:
+                break
+
+        if not selected:
+            last_attempt = attempts[-1] if attempts else None
             raise RuntimeError(
-                "thumbnail ffmpeg failed\n"
-                f"returncode={tp.returncode}\n"
-                f"stderr_tail={tp.stderr[-20000:]}\n"
-                f"stdout_tail={tp.stdout[-20000:]}\n"
-                f"cmd={thumb_cmd}"
+                "thumbnail could not be encoded below the configured max_bytes "
+                f"({max_bytes}); last_attempt={last_attempt}"
             )
 
-        thumb_result = upload_to_r2(TMP_THUMB_OUT, thumb_out_key)
+        uploaded = upload_to_r2(TMP_THUMB_OUT, thumb_out_key)
+        thumb_result = {
+            **uploaded,
+            "width": selected["width"],
+            "height": selected["height"],
+            "size_bytes": selected["size_bytes"],
+            "jpg_quality": selected["jpg_quality"],
+            "max_bytes": max_bytes,
+            "attempts": attempts,
+        }
 
     return thumb_result, thumb_cmd
 
