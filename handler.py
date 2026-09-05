@@ -866,6 +866,66 @@ def _expand_ass_synced_text_events(templates: list, timing_ass_path: str | None)
     return expanded, len(expanded)
 
 
+def _letter_width_factor(character: str) -> float:
+    """A compact visual-width estimate for individually animated ASS letters."""
+    if character.isspace():
+        return 0.28
+    if character in "I1!|.,'`:;":
+        return 0.25
+    if character in "MW@#":
+        return 0.66
+    return 0.47
+
+
+def _make_letter_bounce_dialogues(*, text: str, start_s: float, end_s: float,
+                                  style_name: str, layer: int, size: int,
+                                  x: int, y: int, alignment: int,
+                                  fade_in_ms: int, fade_out_ms: int) -> list[str]:
+    """Make each glyph enter with its own short bounce and rotation.
+
+    This is used only for short celebratory phrases. The measured positioning
+    approximation is intentionally a little playful, while keeping a clear
+    centered word card at 4K.
+    """
+    lines = str(text).replace(r"\N", "\n").replace(r"\n", "\n").splitlines() or [""]
+    duration_ms = max(50, int(round((end_s - start_s) * 1000)))
+    line_step = int(size * 0.94)
+    dialogues = []
+    glyph_number = 0
+    for line_index, line in enumerate(lines):
+        widths = [_letter_width_factor(character) * size for character in line]
+        cursor_x = x - sum(widths) / 2.0
+        line_y = y + (line_index - (len(lines) - 1) / 2.0) * line_step
+        for character, width in zip(line, widths):
+            center_x = int(round(cursor_x + width / 2.0))
+            cursor_x += width
+            if character.isspace():
+                continue
+            delay = min(max(0, duration_ms - 430), (glyph_number % 6) * 55)
+            rise = 85 + (glyph_number % 4) * 22
+            twist = -8 + (glyph_number % 5) * 4
+            rise_end = min(duration_ms, delay + 260)
+            settle_end = min(duration_ms, delay + 480)
+            tags = (
+                f"\\an5\\move({center_x},{int(line_y + rise)},{center_x},{int(line_y)},{delay},{rise_end})"
+                f"\\fad({fade_in_ms},{fade_out_ms})\\frz{twist}\\fscx60\\fscy60"
+                f"\\t({delay},{rise_end},\\frz{-twist // 2}\\fscx118\\fscy118)"
+                f"\\t({rise_end},{settle_end},\\frz0\\fscx100\\fscy100)"
+            )
+            dialogues.append(
+                "Dialogue: {layer},{start},{end},{style},,0000,0000,0000,,{{{tags}}}{text}\n".format(
+                    layer=layer,
+                    start=seconds_to_ass_time(start_s),
+                    end=seconds_to_ass_time(end_s),
+                    style=style_name,
+                    tags=tags,
+                    text=_escape_ass_text(character),
+                )
+            )
+            glyph_number += 1
+    return dialogues
+
+
 def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
     """Build one ASS document containing independently timed theme text events."""
     if not isinstance(events, list):
@@ -910,6 +970,14 @@ def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
             margin_r=0,
             margin_v=0,
         ))
+
+        if animation == "letter_bounce":
+            dialogues.extend(_make_letter_bounce_dialogues(
+                text=text, start_s=start_s, end_s=end_s, style_name=style_name,
+                layer=layer, size=size, x=x, y=y, alignment=alignment,
+                fade_in_ms=fade_in_ms, fade_out_ms=fade_out_ms,
+            ))
+            continue
 
         duration_ms = max(50, int(round((end_s - start_s) * 1000)))
         tags = [f"\\an{alignment}", f"\\pos({x},{y})", f"\\fad({fade_in_ms},{fade_out_ms})"]
