@@ -722,6 +722,7 @@ def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
         y = int(raw.get("y", play_h // 2))
         fade_in_ms = max(0, int(raw.get("fade_in_ms", 250)))
         fade_out_ms = max(0, int(raw.get("fade_out_ms", 250)))
+        layer = max(0, int(raw.get("layer", 20)))
         animation = str(raw.get("animation", "fade")).strip().lower()
 
         styles.append(_make_style_line(
@@ -756,9 +757,25 @@ def _make_text_events_ass(events: list, play_w: int, play_h: int) -> str:
                 f"\\t(0,{midpoint},\\fscx108\\fscy108)",
                 f"\\t({midpoint},{duration_ms},\\fscx100\\fscy100)",
             ])
+        elif animation in {"slide_up", "slide_down", "slide_left", "slide_right"}:
+            # Animate into the final position, then keep it there until the fade.
+            # This is deliberately short so title cards remain easy to read.
+            distance = max(10, int(raw.get("motion_distance", 170)))
+            move_ms = min(600, max(180, duration_ms // 3))
+            start_x, start_y = x, y
+            if animation == "slide_up":
+                start_y += distance
+            elif animation == "slide_down":
+                start_y -= distance
+            elif animation == "slide_left":
+                start_x += distance
+            else:
+                start_x -= distance
+            tags.append(f"\\move({start_x},{start_y},{x},{y},0,{move_ms})")
 
         dialogues.append(
-            "Dialogue: 20,{start},{end},{style},,0000,0000,0000,,{{{tags}}}{text}\n".format(
+            "Dialogue: {layer},{start},{end},{style},,0000,0000,0000,,{{{tags}}}{text}\n".format(
+                layer=layer,
                 start=seconds_to_ass_time(start_s),
                 end=seconds_to_ass_time(end_s),
                 style=style_name,
