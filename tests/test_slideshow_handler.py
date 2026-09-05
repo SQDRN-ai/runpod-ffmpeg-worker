@@ -110,6 +110,9 @@ class SlideshowIntegrationTest(unittest.TestCase):
             self.assertTrue(result.get("generated_text_events_used"))
             self.assertTrue(os.path.exists(uploaded_video))
             self.assertTrue(os.path.exists(uploaded_thumbnail))
+            self.assertEqual(result["thumbnail_uploaded"]["width"], 640)
+            self.assertEqual(result["thumbnail_uploaded"]["height"], 360)
+            self.assertLessEqual(result["thumbnail_uploaded"]["size_bytes"], 1_950_000)
 
 
 if __name__ == "__main__":
